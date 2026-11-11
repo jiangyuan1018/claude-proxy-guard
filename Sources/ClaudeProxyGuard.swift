@@ -6,22 +6,25 @@ struct CheckResult: Decodable {
     let message: String
     let ip: String?
     let country: String?
+    let expectedCountry: String?
 
-    init(ok: Bool, message: String, ip: String? = nil, country: String? = nil) {
+    init(ok: Bool, message: String, ip: String? = nil, country: String? = nil, expectedCountry: String? = nil) {
         self.ok = ok
         self.message = message
         self.ip = ip
         self.country = country
+        self.expectedCountry = expectedCountry
     }
 }
 
 func mayOpenClaude(_ result: CheckResult, online: Bool?) -> Bool {
-    result.ok && result.country == "US" && !(result.ip ?? "").isEmpty && online == true
+    let target = (result.expectedCountry ?? "US").uppercased()
+    return result.ok && result.country == target && !(result.ip ?? "").isEmpty && online == true
 }
 
 func checkProxy(quick: Bool = false, selfTest: Bool = false) -> CheckResult {
     guard let script = Bundle.main.url(forResource: "proxy_check", withExtension: "rb") else {
-        return CheckResult(ok: false, message: "检测文件缺失，请重新安装 Claude 出口守卫。")
+        return CheckResult(ok: false, message: "检测文件缺失，请重新安装 Claude 代理守卫。")
     }
     let process = Process()
     let output = Pipe()
@@ -119,9 +122,9 @@ let claudeURL = URL(fileURLWithPath: "/Applications/Claude.app")
 final class GuardApp: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var panel: NSWindow!
-    private let statusLine = NSMenuItem(title: "尚未核验美国出口", action: nil, keyEquivalent: "")
+    private let statusLine = NSMenuItem(title: "尚未核验代理出口", action: nil, keyEquivalent: "")
     private let ipMenuLine = NSMenuItem(title: "Claude 出口 IP：待核验", action: nil, keyEquivalent: "")
-    private let statusLabel = NSTextField(wrappingLabelWithString: "先确认美国出口，再启动 Claude。")
+    private let statusLabel = NSTextField(wrappingLabelWithString: "先确认代理出口，再启动 Claude。")
     private let heroTitle = NSTextField(labelWithString: "核验后再出发")
     private let badgeLabel = NSTextField(labelWithString: "待核验")
     private let stateBadge = NSView()
@@ -188,7 +191,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
 
     private func buildPanel() {
         panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 536), styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView], backing: .buffered, defer: false)
-        panel.title = "Claude 出口守卫"
+        panel.title = "Claude 代理守卫"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
@@ -200,10 +203,10 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         if let url = Bundle.main.url(forResource: "Mascot", withExtension: "png"), let icon = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = icon
         }
-        let title = NSTextField(labelWithString: "Claude · 出口守卫")
+        let title = NSTextField(labelWithString: "Claude · 代理守卫")
         title.font = .systemFont(ofSize: 20, weight: .bold)
         title.textColor = PixelTheme.ink
-        let subtitle = NSTextField(labelWithString: "CLAUDE // EGRESS GUARD")
+        let subtitle = NSTextField(labelWithString: "CLAUDE // PROXY GUARD")
         subtitle.font = .monospacedSystemFont(ofSize: 9, weight: .medium)
         subtitle.textColor = PixelTheme.muted
         let heading = NSStackView(views: [title, subtitle])
@@ -309,7 +312,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
             image.isTemplate = false
             statusItem.button?.image = image
         }
-        statusItem.button?.toolTip = "Claude 出口守卫：先检查美国出口，再启动"
+        statusItem.button?.toolTip = "Claude 代理守卫：先检查代理出口，再启动"
         statusLine.isEnabled = false
         ipMenuLine.isEnabled = false
         let menu = NSMenu()
@@ -329,7 +332,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
     }
 
     private func setStatus(_ text: String, good: Bool) {
-        heroTitle.stringValue = good ? "美国出口已就绪" : "本次检查未通过"
+        heroTitle.stringValue = good ? "代理出口已就绪" : "本次检查未通过"
         statusLabel.stringValue = text
         statusLabel.textColor = PixelTheme.muted
         badgeLabel.stringValue = good ? "已就绪" : "需处理"
@@ -341,7 +344,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         ipLabel.textColor = good ? PixelTheme.mint : PixelTheme.muted
         countryLabel.textColor = good ? PixelTheme.mint : PixelTheme.muted
         ipCaption.stringValue = good ? "Claude 专用出口 IP" : (ipLabel.stringValue == "—" ? "出口 IP · 尚未核验" : "上次核验出口 IP")
-        statusLine.title = good ? "美国出口检查通过" : "尚未允许启动 / 已请求退出"
+        statusLine.title = good ? "代理出口检查通过" : "尚未允许启动 / 已请求退出"
         statusItem.button?.title = good ? "" : "!"
         statusItem.button?.toolTip = text
     }
@@ -357,7 +360,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         } else if !claudeApps.isEmpty && closingPIDs.isEmpty {
             startCheck(full: true)
         } else if panel.isVisible {
-            setStatus("网络已连接，请重新核验美国出口后启动。", good: false)
+            setStatus("网络已连接，请重新核验代理出口后启动。", good: false)
         }
     }
 
@@ -391,7 +394,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         launchButton.isEnabled = false
         refreshButton.isEnabled = false
         let ticket = generation
-        if full { showChecking("正在检查代理连接和美国出口，请稍候。") }
+        if full { showChecking("正在检查代理连接和目标出口，请稍候。") }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result = checkProxy(quick: !full)
             DispatchQueue.main.async {
@@ -408,11 +411,11 @@ final class GuardApp: NSObject, NSApplicationDelegate {
                     self.checkedLabel.stringValue = "核验于 " + DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
                 }
                 guard result.ok, !full || mayOpenClaude(result, online: self.online) else {
-                    self.block(result.ok ? "未取得有效的美国出口核验结果，禁止启动 Claude。" : result.message)
+                    self.block(result.ok ? "未取得有效的目标出口核验结果，禁止启动 Claude。" : result.message)
                     return
                 }
                 if full { self.lastFullCheck = Date() }
-                self.setStatus("美国出口已核验，代理连通正常。运行中将持续监测。", good: true)
+                self.setStatus(result.message, good: true)
                 if self.pendingLaunch {
                     if full { self.launchClaude(ticket: ticket) }
                     else { self.startCheck(full: true) }
@@ -437,7 +440,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 self.openingClaude = false
                 guard error == nil, let app = app else {
-                    self.setStatus("美国出口检查通过，但 Claude 未能启动。请确认 App 已安装。", good: false)
+                    self.setStatus("代理出口检查通过，但 Claude 未能启动。请确认 App 已安装。", good: false)
                     return
                 }
                 guard self.online == true, self.generation == ticket else {
@@ -470,7 +473,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
     }
     @objc private func quitGuard() {
         let alert = NSAlert()
-        alert.messageText = "退出 Claude 出口保护？"
+        alert.messageText = "退出 Claude 代理守卫？"
         alert.informativeText = "退出后将停止启动检查和断网退出监测；下次登录电脑会恢复运行。"
         alert.addButton(withTitle: "继续保护")
         alert.addButton(withTitle: "退出守卫")
@@ -484,10 +487,12 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(!mayOpenClaude(valid, online: false))
     precondition(!mayOpenClaude(valid, online: nil))
     precondition(!mayOpenClaude(CheckResult(ok: true, message: "bad", ip: "192.0.2.20", country: "CN"), online: true))
+    precondition(mayOpenClaude(CheckResult(ok: true, message: "jp", ip: "192.0.2.30", country: "JP", expectedCountry: "JP"), online: true))
+    precondition(!mayOpenClaude(CheckResult(ok: true, message: "mismatch", ip: "192.0.2.10", country: "US", expectedCountry: "JP"), online: true))
     precondition(!mayOpenClaude(CheckResult(ok: false, message: "failed", ip: "192.0.2.10", country: "US"), online: true))
     precondition(!mayOpenClaude(CheckResult(ok: true, message: "missing IP", country: "US"), online: true))
-    let decoded = try JSONDecoder().decode(CheckResult.self, from: Data("{\"ok\":false,\"message\":\"blocked\",\"ip\":\"192.0.2.20\",\"country\":\"CN\"}".utf8))
-    precondition(decoded.ip == "192.0.2.20" && !mayOpenClaude(decoded, online: true))
+    let decoded = try JSONDecoder().decode(CheckResult.self, from: Data("{\"ok\":false,\"message\":\"blocked\",\"ip\":\"192.0.2.20\",\"country\":\"CN\",\"expectedCountry\":\"US\"}".utf8))
+    precondition(decoded.ip == "192.0.2.20" && decoded.expectedCountry == "US" && !mayOpenClaude(decoded, online: true))
     let result = checkProxy(selfTest: true)
     precondition(result.ok, result.message)
     print("启动门禁及离线拒绝自检通过；" + result.message)
@@ -496,6 +501,7 @@ if CommandLine.arguments.contains("--self-test") {
     var output: [String: Any] = ["ok": result.ok, "message": result.message]
     if let ip = result.ip { output["ip"] = ip }
     if let country = result.country { output["country"] = country }
+    if let expectedCountry = result.expectedCountry { output["expectedCountry"] = expectedCountry }
     let data = try JSONSerialization.data(withJSONObject: output)
     FileHandle.standardOutput.write(data)
     FileHandle.standardOutput.write(Data("\n".utf8))
