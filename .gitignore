@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+*.app/
+*.dmg
+*.zip
+*.log
+*.local.*
+assets/Mascot.png
+secrets/
+backups/

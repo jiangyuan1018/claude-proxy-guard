@@ -1,0 +1,39 @@
+# Replace these placeholders locally. This example contains no usable proxy credentials.
+mixed-port: 7897
+allow-lan: false
+mode: rule
+log-level: warning
+ipv6: false
+dns:
+  enable: false
+
+proxies:
+  - name: 供应商-HTTP
+    type: http
+    server: proxy.example.invalid
+    port: 12345
+    username: REPLACE_WITH_YOUR_USERNAME
+    password: REPLACE_WITH_YOUR_PASSWORD
+
+proxy-groups:
+  - name: Claude专用
+    type: select
+    proxies:
+      - 供应商-HTTP
+    url: https://api.anthropic.com/
+    interval: 120
+    timeout: 6000
+    lazy: true
+
+rules:
+  - DOMAIN-SUFFIX,whatismyipaddress.com,Claude专用
+  - DOMAIN-SUFFIX,ipinfo.io,Claude专用
+  - DOMAIN-SUFFIX,ipapi.co,Claude专用
+  - DOMAIN-SUFFIX,claude.ai,Claude专用
+  - DOMAIN-SUFFIX,claude.com,Claude专用
+  - DOMAIN-SUFFIX,claude.app,Claude专用
+  - DOMAIN-SUFFIX,claudeusercontent.com,Claude专用
+  - DOMAIN-SUFFIX,claudemcpcontent.com,Claude专用
+  - DOMAIN-SUFFIX,anthropic.com,Claude专用
+  - DOMAIN-SUFFIX,anthropic.services,Claude专用
+  - MATCH,DIRECT
