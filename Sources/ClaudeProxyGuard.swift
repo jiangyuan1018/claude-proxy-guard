@@ -26,36 +26,36 @@ struct CheckResult: Decodable {
     }
 }
 
-enum MonitorDecision { case allow, retry, block }
+enum MonitorDecision { case allow, warn, block }
 
 struct RuntimePolicy {
     private(set) var failures = 0
 
-    mutating func evaluate(_ result: CheckResult, running: Bool, pendingLaunch: Bool, verifiedRecently: Bool) -> MonitorDecision {
+    mutating func evaluate(_ result: CheckResult, running: Bool, pendingLaunch: Bool) -> MonitorDecision {
         if result.ok { failures = 0; return .allow }
         failures += 1
-        if result.kind == .transient, running, !pendingLaunch, verifiedRecently, failures < 3 { return .retry }
-        return .block
+        // Network loss is handled by NWPathMonitor; failed probes alone never quit a running session.
+        if result.kind == .country { return .block }
+        return running || !pendingLaunch ? .warn : .block
     }
 }
 
 func testRuntimePolicy() throws {
     var policy = RuntimePolicy()
     let timeout = CheckResult(ok: false, message: "测试超时", kind: .transient, code: "timeout")
-    guard policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: true) == .retry else {
-        throw NSError(domain: "GuardRegression", code: 1, userInfo: [NSLocalizedDescriptionKey: "单次检测超时误触发退出：应当先重试。"])
+    for attempt in 1...20 {
+        guard policy.evaluate(timeout, running: true, pendingLaunch: false) == .warn else {
+            throw NSError(domain: "GuardRegression", code: 1, userInfo: [NSLocalizedDescriptionKey: "连续第 \(attempt) 次测速超时误触发退出，应当仅告警。"])
+        }
     }
-    precondition(policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: true) == .retry)
-    precondition(policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: true) == .block)
-    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: true, pendingLaunch: false, verifiedRecently: true) == .allow)
+    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: true, pendingLaunch: false) == .allow)
     precondition(policy.failures == 0)
-    precondition(policy.evaluate(timeout, running: true, pendingLaunch: true, verifiedRecently: true) == .block)
-    precondition(policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: false) == .block)
-    precondition(policy.evaluate(timeout, running: false, pendingLaunch: false, verifiedRecently: true) == .block)
-    for kind in [FailureKind.configuration, .country] {
-        var hardPolicy = RuntimePolicy()
-        precondition(hardPolicy.evaluate(CheckResult(ok: false, message: "blocked", kind: kind), running: true, pendingLaunch: false, verifiedRecently: true) == .block)
-    }
+    precondition(policy.evaluate(timeout, running: true, pendingLaunch: true) == .warn)
+    precondition(policy.evaluate(timeout, running: false, pendingLaunch: false) == .warn)
+    precondition(policy.evaluate(timeout, running: false, pendingLaunch: true) == .block)
+    precondition(policy.evaluate(CheckResult(ok: false, message: "configuration", kind: .configuration), running: true, pendingLaunch: false) == .warn)
+    precondition(policy.evaluate(CheckResult(ok: false, message: "country unknown", ip: "192.0.2.10", kind: .transient), running: true, pendingLaunch: false) == .warn)
+    precondition(policy.evaluate(CheckResult(ok: false, message: "non-US", ip: "192.0.2.20", country: "CN", kind: .country), running: true, pendingLaunch: false) == .block)
 }
 
 struct IPRecord: Codable {
@@ -302,8 +302,9 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     private var permittedPID: pid_t?
     private var closingPIDs = Set<pid_t>()
     private var generation = 0
-    private var lastFullCheck = Date.distantPast
     private var lastFullAttempt = Date.distantPast
+    private var lastMonitoringAlert = Date.distantPast
+    private var exitWarning: String?
     private var runtimePolicy = RuntimePolicy()
 
     private var claudeApps: [NSRunningApplication] {
@@ -317,7 +318,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
             displayExit(ip: last.ip, country: last.country, at: last.lastSeen)
             ipCaption.stringValue = "上次记录出口 IP"
         }
-        recordEvent("guard_started", code: "startup", message: "守卫已启动；IP 每 60 秒核验，临时检测失败最多重试 2 次。")
+        recordEvent("guard_started", code: "startup", message: "守卫已启动；IP 每 60 秒核验，测速或查询失败仅告警，断网或确认出口国家不符时请求退出。")
         configureNotifications()
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] event in
@@ -345,7 +346,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
             guard let self = self, self.closingPIDs.isEmpty else { return }
             let active = !self.claudeApps.isEmpty || self.pendingLaunch
-            let full = (active && self.runtimePolicy.failures > 0) || Date().timeIntervalSince(active ? self.lastFullCheck : self.lastFullAttempt) >= 60
+            let full = Date().timeIntervalSince(self.lastFullAttempt) >= 60
             if active || full { self.startCheck(full: full) }
         }
         RunLoop.main.add(timer!, forMode: .common)
@@ -445,7 +446,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         let links = NSStackView(views: [refresh, clash, historyButton])
         links.orientation = .horizontal; links.spacing = 12; links.distribution = .fillEqually
         historyNote.font = .systemFont(ofSize: 10); historyNote.textColor = PixelTheme.muted
-        let hint = NSTextField(wrappingLabelWithString: "连接每 5 秒检查 · IP 每 60 秒记录 · 变化时提醒\n临时失败先重试；断网、分流异常或出口国家不符立即请求退出。")
+        let hint = NSTextField(wrappingLabelWithString: "连接每 5 秒检查 · IP 每 60 秒记录 · 变化时提醒\n测速失败仅提醒；断网或确认出口国家不符时请求退出。")
         hint.font = .systemFont(ofSize: 10); hint.textColor = PixelTheme.muted
         hint.alignment = .center
         let stack = NSStackView(views: [header, hero, ipCard, launchButton, links, historyNote, hint])
@@ -554,6 +555,23 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         }
     }
 
+    private func notifyMonitorWarning(_ result: CheckResult) {
+        guard Date().timeIntervalSince(lastMonitoringAlert) >= 600 else { return }
+        lastMonitoringAlert = Date()
+        recordEvent("monitor_warning", code: result.code ?? "check_warning", message: "仅提醒，未请求 Claude 退出。" + result.message)
+        let content = UNMutableNotificationContent()
+        content.title = "Claude 网络检测告警"
+        content.body = result.message + "\nClaude 保持运行，守卫将继续复核出口。"
+        content.sound = .default
+        content.threadIdentifier = "ClaudeGuard.MonitorWarnings"
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { [weak self] error in
+            if error != nil {
+                DispatchQueue.main.async { self?.recordEvent("notification_unavailable", code: "warning_notification_unavailable", message: "系统通知未能发送；检测告警已显示在守卫面板。") }
+            }
+        }
+        panel.orderFrontRegardless()
+    }
+
     private func notifyIPChange(_ change: IPChange, expectedCountry: String) {
         let explanation = change.current.country == expectedCountry ? "新出口仍符合目标国家（\(expectedCountry)）；IP 变化本身不会触发退出。" : "新出口尚未通过目标国家核验，请查看保护状态。"
         let content = UNMutableNotificationContent()
@@ -638,7 +656,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     private func updateHistoryText() {
         guard let text = historyText else { return }
         let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm:ss"
-        let labels = ["guard_started": "守卫启动", "ip_changed": "IP 变化", "check_failed": "检测失败", "check_recovered": "检测恢复", "network_offline": "网络断开", "network_online": "网络连接", "blocked": "保护拦截", "quit_requested": "请求退出", "quit_rejected": "退出未接受", "claude_exited": "Claude 已退出", "notification_unavailable": "通知状态"]
+        let labels = ["guard_started": "守卫启动", "ip_changed": "IP 变化", "check_failed": "检测失败", "check_recovered": "检测恢复", "monitor_warning": "仅提醒，未退出", "network_offline": "网络断开", "network_online": "网络连接", "blocked": "保护拦截", "quit_requested": "请求退出", "quit_rejected": "退出未接受", "claude_exited": "Claude 已退出", "notification_unavailable": "通知状态"]
         var lines = ["出口 IP 历史", "同一 IP 的连续核验会合并；时间为本机时间。仅保留最近 500 段记录和 1000 条事件。", ""]
         if let error = historyError { lines += [error, ""] }
         if history.snapshot.records.isEmpty { lines += ["尚无出口核验记录。", ""] }
@@ -719,27 +737,37 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
                     if let change = change { self.notifyIPChange(change, expectedCountry: result.expectedCountry ?? "US") }
                 }
                 let previousFailures = self.runtimePolicy.failures
-                let decision = self.runtimePolicy.evaluate(result, running: !self.claudeApps.isEmpty, pendingLaunch: self.pendingLaunch, verifiedRecently: Date().timeIntervalSince(self.lastFullCheck) < 120)
+                let previousExitWarning = self.exitWarning
+                if full { self.exitWarning = result.ip == nil || result.country == nil ? result.message : nil }
+                let running = !self.claudeApps.isEmpty
+                let decision = self.runtimePolicy.evaluate(result, running: running, pendingLaunch: self.pendingLaunch)
                 if !result.ok {
                     self.recordEvent("check_failed", code: result.code ?? "unclassified_failure", message: "\(full ? "出口完整核验" : "连通性检查")失败，第 \(self.runtimePolicy.failures) 次：" + result.message)
                 }
-                if decision == .retry {
-                    self.setStatus("检测暂时失败（\(self.runtimePolicy.failures)/3），正在重试，尚未请求退出。" + result.message, good: false)
-                    self.heroTitle.stringValue = "检测波动，正在复核"
-                    self.statusLine.title = "正在重试，尚未请求退出"
+                if decision == .warn {
+                    self.pendingLaunch = false
+                    self.setStatus((running ? "仅提醒，Claude 保持运行。" : "本次检测未通过，启动前需重新核验。") + result.message, good: false)
+                    self.heroTitle.stringValue = "检测告警，继续监测"
+                    self.badgeLabel.stringValue = "告警"
+                    self.statusLine.title = running ? "检测告警，Claude 继续运行" : "出口尚待核验"
+                    if running { self.notifyMonitorWarning(result) }
                     return
                 }
                 guard decision == .allow, !full || mayOpenClaude(result, online: self.online) else {
                     let message = result.ok ? "未取得有效的目标出口核验结果，禁止启动 Claude。" : result.message
-                    let prefix = result.kind == .transient && self.runtimePolicy.failures >= 3 ? "连续 3 次检测失败，触发保护。" : ""
-                    self.block(prefix + message, reason: result.code ?? "invalid_exit")
+                    self.block(message, reason: result.code ?? "invalid_exit")
                     return
                 }
-                if previousFailures > 0 {
+                if (previousFailures > 0 || (full && previousExitWarning != nil)) && self.exitWarning == nil {
                     self.recordEvent("check_recovered", code: "recovered", message: "检测恢复正常，失败计数已清零。")
                 }
-                if full { self.lastFullCheck = Date() }
-                self.setStatus(result.message, good: true)
+                if let warning = self.exitWarning {
+                    self.setStatus("连通性检查通过，出口信息仍待复核。" + warning, good: false)
+                    self.heroTitle.stringValue = "出口信息待复核"
+                    self.statusLine.title = "出口信息待复核，Claude 继续运行"
+                } else {
+                    self.setStatus(result.message, good: true)
+                }
                 if self.pendingLaunch {
                     if full { self.launchClaude(ticket: ticket) }
                     else { self.startCheck(full: true) }

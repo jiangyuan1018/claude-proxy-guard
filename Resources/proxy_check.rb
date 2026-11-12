@@ -93,6 +93,7 @@ rescue JSON::ParserError
 end
 
 def check_proxy(quick: false)
+  verified = nil
   settings = load_settings
   root = File.expand_path('~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev')
   base = read_yaml(File.join(root, 'config.yaml'))
@@ -113,16 +114,23 @@ def check_proxy(quick: false)
   end
   state = api.call('/configs')
   verify_state(system_proxy, state, api.call('/rules').fetch('rules'), api.call('/proxies').fetch('proxies'), group: settings[:group], node: settings[:node])
+  unless quick
+    port = state.fetch('mixed-port').to_i
+    info = curl_json(['--proxy', "http://127.0.0.1:#{port}", '--noproxy', '', '--connect-timeout', '3', '--max-time', '8', 'https://ipinfo.io/json'], label: '出口 IP 查询')
+    verified = verify_country(info, settings[:country])
+  end
   query = URI.encode_www_form('url' => 'https://api.anthropic.com/', 'timeout' => '6000')
   encoded_node = URI.encode_www_form_component(settings[:node]).gsub('+', '%20')
   health = api.call('/proxies/' + encoded_node + '/delay?' + query, 8)
   raise CheckFailed.new("锁定节点“#{settings[:node]}”无法通过 Anthropic 连通性检测，请检查节点。", kind: 'transient', code: 'anthropic_unreachable') unless health['delay'].to_i > 0
   return { ok: true, message: '系统代理、Claude 分流和 Anthropic 连通性检查通过。', expectedCountry: settings[:country] } if quick
-  port = state.fetch('mixed-port').to_i
-  info = curl_json(['--proxy', "http://127.0.0.1:#{port}", '--noproxy', '', '--connect-timeout', '3', '--max-time', '8', 'https://ipinfo.io/json'], label: '出口 IP 查询')
-  verified = verify_country(info, settings[:country])
   label = settings[:country] == 'US' ? '美国出口' : "#{settings[:country]} 出口"
   { ok: true, message: "#{label}已核验，代理连通正常。运行中将持续监测。" }.merge(verified)
+rescue CheckFailed => error
+  if verified
+    raise CheckFailed.new(error.message, ip: verified[:ip], country: verified[:country], kind: error.kind, code: error.code)
+  end
+  raise
 end
 
 def self_test
@@ -140,7 +148,7 @@ def self_test
   begin
     parse_curl_result("\n503", 22, '本机 Clash 检测', 'configuration')
   rescue CheckFailed => error
-    raise 'Unverifiable local routing must stop immediately' unless error.kind == 'configuration'
+    raise 'Local routing errors must remain distinct from country mismatches' unless error.kind == 'configuration'
   end
   system_proxy = %w[HTTP HTTPS].each_with_object({}) do |kind, result|
     result.merge!(kind + 'Enable' => '1', kind + 'Proxy' => '127.0.0.1', kind + 'Port' => '7897')
@@ -190,13 +198,15 @@ def self_test
   { ok: true, message: "自检通过：正常状态及 #{failures.length} 种异常状态均符合预期，出口 IP 会保留供面板显示。" }
 end
 
-expected = 'US'
-begin
-  expected = load_settings[:country] unless ARGV.include?('--self-test')
-  result = ARGV.include?('--self-test') ? self_test : check_proxy(quick: ARGV.include?('--quick'))
-rescue CheckFailed => error
-  result = { ok: false, message: error.message, ip: error.ip, country: error.country, expectedCountry: expected, kind: error.kind, code: error.code }
-rescue StandardError
-  result = { ok: false, message: '检测未能完成，暂时无法确认代理出口。请手动检查 Clash Verge。', expectedCountry: expected, kind: 'configuration', code: 'checker_error' }
+if $PROGRAM_NAME == __FILE__
+  expected = 'US'
+  begin
+    expected = load_settings[:country] unless ARGV.include?('--self-test')
+    result = ARGV.include?('--self-test') ? self_test : check_proxy(quick: ARGV.include?('--quick'))
+  rescue CheckFailed => error
+    result = { ok: false, message: error.message, ip: error.ip, country: error.country, expectedCountry: expected, kind: error.kind, code: error.code }
+  rescue StandardError
+    result = { ok: false, message: '检测未能完成，暂时无法确认代理出口。请手动检查 Clash Verge。', expectedCountry: expected, kind: 'configuration', code: 'checker_error' }
+  end
+  puts JSON.generate(result)
 end
-puts JSON.generate(result)

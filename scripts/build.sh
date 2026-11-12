@@ -25,6 +25,7 @@ cp "$task_root/Resources/Info.plist" "$task_app/Contents/Info.plist"
 cp "$task_root/Resources/proxy_check.rb" "$task_app/Contents/Resources/proxy_check.rb"
 /usr/bin/plutil -lint "$task_app/Contents/Info.plist"
 /usr/bin/ruby -c "$task_app/Contents/Resources/proxy_check.rb"
+/usr/bin/ruby "$task_root/tests/probe_order.rb"
 /usr/bin/codesign --force --sign - --timestamp=none "$task_app"
 /usr/bin/codesign --verify --deep --strict "$task_app"
 "$task_app/Contents/MacOS/ClaudeProxyGuard" --self-test
