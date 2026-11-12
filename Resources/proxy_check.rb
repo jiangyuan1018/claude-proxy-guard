@@ -5,10 +5,11 @@ require 'uri'
 require 'ipaddr'
 
 class CheckFailed < StandardError
-  attr_reader :ip, :country
-  def initialize(message, ip: nil, country: nil)
+  attr_reader :ip, :country, :kind, :code
+  def initialize(message, ip: nil, country: nil, kind: 'configuration', code: 'configuration')
     super(message)
     @ip, @country = ip, country
+    @kind, @code = kind, code
   end
 end
 
@@ -57,13 +58,13 @@ def verify_country(info, expected_country = 'US')
   begin
     ip = IPAddr.new(info.fetch('ip')).to_s
   rescue IPAddr::InvalidAddressError, KeyError, TypeError
-    raise CheckFailed, '未能取得有效的出口 IP，禁止启动 Claude。'
+    raise CheckFailed.new('出口查询未返回有效 IP，暂时无法确认出口。', kind: 'transient', code: 'invalid_ip')
   end
   country = info['country'].is_a?(String) && info['country'].match?(/\A[A-Z]{2}\z/) ? info['country'] : nil
   unless country == expected_country
     target_name = expected_country == 'US' ? '美国 (US)' : expected_country
     message = country ? "出口国家为 #{country}，不是 #{target_name}，禁止启动 Claude。" : '无法确认出口国家，禁止启动 Claude。'
-    raise CheckFailed.new(message, ip: ip, country: country)
+    raise CheckFailed.new(message, ip: ip, country: country, kind: country ? 'country' : 'transient', code: country ? 'country_mismatch' : 'country_unknown')
   end
   { ip: ip, country: country, expectedCountry: expected_country }
 end
@@ -74,10 +75,21 @@ def read_yaml(path)
   value
 end
 
-def curl_json(arguments, config = '')
-  output, _error, status = Open3.capture3('/usr/bin/curl', '-q', '--silent', '--fail', *arguments, stdin_data: config)
-  raise CheckFailed, '代理检测请求未成功，暂时无法确认网络出口。' unless status.success?
-  JSON.parse(output)
+def curl_json(arguments, config = '', label: '代理检测', kind: 'transient')
+  output, _error, status = Open3.capture3('/usr/bin/curl', '-q', '--silent', '--fail', '--write-out', "\n%{http_code}", *arguments, stdin_data: config)
+  parse_curl_result(output, status.exitstatus, label, kind)
+end
+
+def parse_curl_result(output, exit_code, label, kind = 'transient')
+  body, _, http_status = output.rpartition("\n")
+  unless exit_code == 0
+    code = exit_code == 28 ? 'timeout' : (http_status.to_i > 0 ? "http_#{http_status}" : "curl_#{exit_code}")
+    detail = http_status == '429' ? '被限流（HTTP 429）' : (exit_code == 28 ? '超时' : "未成功（#{code}）")
+    raise CheckFailed.new(label + detail + '，暂时无法确认检测结果。', kind: kind, code: code)
+  end
+  JSON.parse(body)
+rescue JSON::ParserError
+  raise CheckFailed.new(label + '返回了无法解析的结果。', kind: kind, code: 'invalid_json')
 end
 
 def check_proxy(quick: false)
@@ -90,7 +102,8 @@ def check_proxy(quick: false)
   secret = runtime['secret'] || base['secret']
   headers = secret.to_s.empty? ? '' : "header = #{JSON.generate('Authorization: Bearer ' + secret.to_s)}\n"
   api = lambda do |path, timeout = 4|
-    curl_json(['--noproxy', '*', '--unix-socket', socket, '--connect-timeout', '2', '--max-time', timeout.to_s, '--config', '-', 'http://localhost' + path], headers)
+    label = path.include?('/delay?') ? 'Anthropic 连通性检测' : '本机 Clash 检测'
+    curl_json(['--noproxy', '*', '--unix-socket', socket, '--connect-timeout', '2', '--max-time', timeout.to_s, '--config', '-', 'http://localhost' + path], headers, label: label, kind: path.include?('/delay?') ? 'transient' : 'configuration')
   end
   text, _error, status = Open3.capture3('/usr/sbin/scutil', '--proxy')
   raise CheckFailed, '无法读取系统代理状态，请手动确认 Clash Verge。' unless status.success?
@@ -103,10 +116,10 @@ def check_proxy(quick: false)
   query = URI.encode_www_form('url' => 'https://api.anthropic.com/', 'timeout' => '6000')
   encoded_node = URI.encode_www_form_component(settings[:node]).gsub('+', '%20')
   health = api.call('/proxies/' + encoded_node + '/delay?' + query, 8)
-  raise CheckFailed, "锁定节点“#{settings[:node]}”无法通过 Anthropic 连通性检测，请检查节点。" unless health['delay'].to_i > 0
+  raise CheckFailed.new("锁定节点“#{settings[:node]}”无法通过 Anthropic 连通性检测，请检查节点。", kind: 'transient', code: 'anthropic_unreachable') unless health['delay'].to_i > 0
   return { ok: true, message: '系统代理、Claude 分流和 Anthropic 连通性检查通过。', expectedCountry: settings[:country] } if quick
   port = state.fetch('mixed-port').to_i
-  info = curl_json(['--proxy', "http://127.0.0.1:#{port}", '--noproxy', '', '--connect-timeout', '3', '--max-time', '8', 'https://ipinfo.io/json'])
+  info = curl_json(['--proxy', "http://127.0.0.1:#{port}", '--noproxy', '', '--connect-timeout', '3', '--max-time', '8', 'https://ipinfo.io/json'], label: '出口 IP 查询')
   verified = verify_country(info, settings[:country])
   label = settings[:country] == 'US' ? '美国出口' : "#{settings[:country]} 出口"
   { ok: true, message: "#{label}已核验，代理连通正常。运行中将持续监测。" }.merge(verified)
@@ -115,6 +128,20 @@ end
 def self_test
   group = 'Claude专用'
   node = '供应商-HTTP'
+  raise 'Successful response did not parse' unless parse_curl_result("{\"ok\":true}\n200", 0, '测试') == { 'ok' => true }
+  [["\n429", 22, 'http_429'], ["\n000", 28, 'timeout'], ["not JSON\n200", 0, 'invalid_json']].each do |output, exit_code, expected|
+    begin
+      parse_curl_result(output, exit_code, '测试')
+      raise 'A failed probe was accepted'
+    rescue CheckFailed => error
+      raise 'Probe failure classification changed' unless error.kind == 'transient' && error.code == expected
+    end
+  end
+  begin
+    parse_curl_result("\n503", 22, '本机 Clash 检测', 'configuration')
+  rescue CheckFailed => error
+    raise 'Unverifiable local routing must stop immediately' unless error.kind == 'configuration'
+  end
   system_proxy = %w[HTTP HTTPS].each_with_object({}) do |kind, result|
     result.merge!(kind + 'Enable' => '1', kind + 'Proxy' => '127.0.0.1', kind + 'Port' => '7897')
   end
@@ -153,6 +180,12 @@ def self_test
     verify_country({ 'ip' => '192.0.2.20', 'country' => 'CN' }, 'US')
   rescue CheckFailed => error
     raise 'Non-US exit IP was lost' unless error.ip == '192.0.2.20' && error.country == 'CN'
+    raise 'Non-US failure must stop immediately' unless error.kind == 'country' && error.code == 'country_mismatch'
+  end
+  begin
+    verify_country('ip' => '192.0.2.20')
+  rescue CheckFailed => error
+    raise 'Unknown country should be retried' unless error.kind == 'transient' && error.code == 'country_unknown'
   end
   { ok: true, message: "自检通过：正常状态及 #{failures.length} 种异常状态均符合预期，出口 IP 会保留供面板显示。" }
 end
@@ -162,8 +195,8 @@ begin
   expected = load_settings[:country] unless ARGV.include?('--self-test')
   result = ARGV.include?('--self-test') ? self_test : check_proxy(quick: ARGV.include?('--quick'))
 rescue CheckFailed => error
-  result = { ok: false, message: error.message, ip: error.ip, country: error.country, expectedCountry: expected }
+  result = { ok: false, message: error.message, ip: error.ip, country: error.country, expectedCountry: expected, kind: error.kind, code: error.code }
 rescue StandardError
-  result = { ok: false, message: '检测未能完成，暂时无法确认代理出口。请手动检查 Clash Verge。', expectedCountry: expected }
+  result = { ok: false, message: '检测未能完成，暂时无法确认代理出口。请手动检查 Clash Verge。', expectedCountry: expected, kind: 'configuration', code: 'checker_error' }
 end
 puts JSON.generate(result)

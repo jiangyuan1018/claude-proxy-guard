@@ -1,6 +1,6 @@
 # Claude Proxy Guard · Claude 代理守卫
 
-**不让 Claude Desktop 裸连发出一包流量 —— 先验明出口再启动，代理异常即刻体面退场。**
+**先核验出口再启动，记录 IP 变化，确认代理异常时请求正常退出。**
 
 专为 **macOS + Clash Verge (Mihomo)** 用户打造的零侵入菜单栏守卫（Fail-Closed Proxy Guard & Kill Switch）。无需 Root / TUN 权限，不篡改代理配置，纯原生 Swift + AppKit 构建。
 
@@ -44,7 +44,9 @@
   - 专用分组当前锁定在指定节点，且通过 `api.anthropic.com` 真实延迟连通测试
   - 经代理实测 IPinfo 出口 IP 合法，且出口国家严格匹配目标地区（默认 `US`）
 - **5s / 60s 双频巡航 + 断网即退**：`NWPathMonitor` 毫秒级感知本机断网；Claude 运行期间每 5 秒快检链路连通性、每 60 秒复核出口国家。
-- **体面退出不丢稿**：异常时发送 macOS 原生正常退出请求（而非粗暴 `kill -9` 强杀），未发完的长文或保存提示可从容先保存再退出。
+- **IP 历史与变化提醒**：记录首次、最近出现时间与核验次数；IP 变化时弹窗及系统通知，Claude 未运行时仍每 60 秒记录。
+- **临时检测失败重试**：近期已有目标出口核验的运行会话，外部检测超时或限流先重试，连续 3 次失败再请求退出；同时记录每次退出原因。
+- **正常退出请求**：异常时发送 macOS 原生正常退出请求（而非粗暴 `kill -9` 强杀），未发完的长文或保存提示可从容先保存再退出。
 - **纯原生 · 零依赖 · 零侵入**：暗紫像素网格面板 + 菜单栏常驻，仅用 macOS 系统自带组件编译；**全程只读检查，绝不修改你的 Clash 配置或系统网络设置**。
 
 ---
@@ -77,7 +79,7 @@
 git clone https://github.com/jiangyuan1018/claude-proxy-guard.git
 cd claude-proxy-guard
 
-# 编译原生 App、生成图标、运行离线门禁自检（覆盖 11 种异常阻断场景）
+# 编译、生成图标，运行门禁、临时失败重试及历史持久化离线自检
 ./scripts/build.sh
 
 # 安装至 ~/Applications/Claude Proxy Guard.app 并注册开机后台自启（LaunchAgent）
@@ -103,16 +105,34 @@ cd claude-proxy-guard
 
 ---
 
+## IP 历史与退出原因
+
+点击面板或菜单栏中的「IP 历史与退出原因」，查看 IP 记录和检测事件。同一 IP、同一国家的连续核验合并为一段，记录首次出现时间、最近核验时间及次数；保留最近 500 段 IP 记录和 1000 条事件。退出请求会注明检测失败、断网、分流异常或原入口启动等原因。
+
+历史仅写入本机，不上传 GitHub 或其他服务。公开版文件位置如下，目录权限为 `0700`，文件为 `0600`：
+
+```text
+~/Library/Application Support/io.github.jiangyuan1018.claude-proxy-guard/ip-history.json
+```
+
+文件包含真实出口 IP；分享截图或反馈问题前请脱敏。重启守卫后会继续读取记录，不会因第一次核验或同一 IP 的重复核验而弹出变化提醒。两个都符合目标国家的 IP 之间的变化只提醒，不因 IP 变化本身请求退出。
+
+系统通知需要 macOS 授权，参见 [Apple 通知授权说明](https://developer.apple.com/documentation/usernotifications/asking-permission-to-use-notifications)。即使系统通知被关闭或未能发送，IP 变化仍会弹出守卫提示；点击系统通知可打开历史窗口。
+
+运行中只在最近 120 秒内已有完整目标出口核验成功时，才容许 Anthropic 连通性或出口 IP 查询临时失败先重试。重试会执行完整核验，连续第 3 次失败即请求正常退出；恢复成功会清零失败次数。待启动操作仍必须当次完整核验通过，无法确认出口时不会启动。实际断网、系统代理或分流改变、确认出口国家不符继续立即触发保护。
+
 ## 工作原理与已知边界
 
 ```text
 Swift / AppKit 菜单栏与暗紫像素状态面板
  ├── NWPathMonitor  ── 实时监听本机网络状态，断网立即阻断启动并请求退出
  ├── proxy_check.rb ── Unix Socket 只读核验 Mihomo 规则/节点 + 实测 Anthropic & IPinfo
+ ├── 本机 JSON / UserNotifications ── 记录 IP 历史、检测和退出事件，发送变化提醒
  └── NSWorkspace    ── 托管安全启动、拦截原入口误点、发送优雅退出请求
 ```
 
 - **应用层门禁而非内核防火墙**：原图标误点拦截发生在应用启动通知回调时，周期巡检也存在秒级间隔，无法替代系统级防火墙的数据包阻断。
+- **退出对象**：只请求 Claude 桌面 App（包含 Code 页面）正常退出，不终止终端里的 `claude` CLI；保存提示或退出拒绝可能需要用户处理。
 - **覆盖域名范围**：规则核验仅针对内置的 7 个 Anthropic / Claude 官方域名；自定义第三方 MCP、外部连接器等服务不在出口保证范围内。
 - **分流规则约定**：检查器要求第一个 `MATCH` 前的规则均为指向专用分组的 `DOMAIN-SUFFIX`；若使用复杂混合规则集，可按需调整 `Resources/proxy_check.rb` 中的 `verify_state`。
 

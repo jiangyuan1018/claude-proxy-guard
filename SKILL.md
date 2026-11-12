@@ -62,7 +62,7 @@ description: Install, configure, verify, or troubleshoot Claude Proxy Guard (Cla
 ./scripts/build.sh
 ```
 
-确认输出包含 `启动门禁及离线拒绝自检通过` 以及 `Built: .../.build/Claude Proxy Guard.app`。
+确认命令退出码为 0，输出包含 `IP 历史持久化与变更检测自检通过` 以及 `Built: .../.build/Claude Proxy Guard.app`。
 
 ### Step 4：安装并执行首次出口核验
 

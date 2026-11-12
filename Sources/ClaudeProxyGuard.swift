@@ -1,5 +1,10 @@
 import AppKit
 import Network
+import UserNotifications
+
+enum FailureKind: String, Codable {
+    case configuration, country, transient
+}
 
 struct CheckResult: Decodable {
     let ok: Bool
@@ -7,14 +12,158 @@ struct CheckResult: Decodable {
     let ip: String?
     let country: String?
     let expectedCountry: String?
+    let kind: FailureKind?
+    let code: String?
 
-    init(ok: Bool, message: String, ip: String? = nil, country: String? = nil, expectedCountry: String? = nil) {
+    init(ok: Bool, message: String, ip: String? = nil, country: String? = nil, expectedCountry: String? = nil, kind: FailureKind? = nil, code: String? = nil) {
         self.ok = ok
         self.message = message
         self.ip = ip
         self.country = country
         self.expectedCountry = expectedCountry
+        self.kind = kind
+        self.code = code
     }
+}
+
+enum MonitorDecision { case allow, retry, block }
+
+struct RuntimePolicy {
+    private(set) var failures = 0
+
+    mutating func evaluate(_ result: CheckResult, running: Bool, pendingLaunch: Bool, verifiedRecently: Bool) -> MonitorDecision {
+        if result.ok { failures = 0; return .allow }
+        failures += 1
+        if result.kind == .transient, running, !pendingLaunch, verifiedRecently, failures < 3 { return .retry }
+        return .block
+    }
+}
+
+func testRuntimePolicy() throws {
+    var policy = RuntimePolicy()
+    let timeout = CheckResult(ok: false, message: "测试超时", kind: .transient, code: "timeout")
+    guard policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: true) == .retry else {
+        throw NSError(domain: "GuardRegression", code: 1, userInfo: [NSLocalizedDescriptionKey: "单次检测超时误触发退出：应当先重试。"])
+    }
+    precondition(policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: true) == .retry)
+    precondition(policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: true) == .block)
+    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: true, pendingLaunch: false, verifiedRecently: true) == .allow)
+    precondition(policy.failures == 0)
+    precondition(policy.evaluate(timeout, running: true, pendingLaunch: true, verifiedRecently: true) == .block)
+    precondition(policy.evaluate(timeout, running: true, pendingLaunch: false, verifiedRecently: false) == .block)
+    precondition(policy.evaluate(timeout, running: false, pendingLaunch: false, verifiedRecently: true) == .block)
+    for kind in [FailureKind.configuration, .country] {
+        var hardPolicy = RuntimePolicy()
+        precondition(hardPolicy.evaluate(CheckResult(ok: false, message: "blocked", kind: kind), running: true, pendingLaunch: false, verifiedRecently: true) == .block)
+    }
+}
+
+struct IPRecord: Codable {
+    var firstSeen: Date
+    var lastSeen: Date
+    let ip: String
+    let country: String?
+    var checks: Int
+}
+
+struct GuardEvent: Codable {
+    let date: Date
+    let kind: String
+    let code: String
+    let message: String
+}
+
+struct IPChange {
+    let previous: IPRecord
+    let current: IPRecord
+    var message: String { "\(previous.ip)（\(previous.country ?? "未知")） → \(current.ip)（\(current.country ?? "未知")）" }
+}
+
+final class IPHistory {
+    struct Snapshot: Codable {
+        var records: [IPRecord] = []
+        var events: [GuardEvent] = []
+    }
+    let url: URL
+    private(set) var snapshot = Snapshot()
+    private var loadError: Error?
+
+    init(url: URL) {
+        self.url = url
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+                snapshot = try decoder.decode(Snapshot.self, from: Data(contentsOf: url))
+            } catch { loadError = error }
+        }
+    }
+
+    func observe(_ result: CheckResult, at date: Date = Date()) -> IPChange? {
+        guard let ip = result.ip, IPv4Address(ip) != nil || IPv6Address(ip) != nil else { return nil }
+        let previous = snapshot.records.last
+        if let previous = previous, previous.ip == ip, previous.country == result.country {
+            snapshot.records[snapshot.records.count - 1].lastSeen = date
+            snapshot.records[snapshot.records.count - 1].checks += 1
+            return nil
+        }
+        let current = IPRecord(firstSeen: date, lastSeen: date, ip: ip, country: result.country, checks: 1)
+        snapshot.records.append(current)
+        snapshot.records = Array(snapshot.records.suffix(500))
+        guard let previous = previous, previous.ip != ip else { return nil }
+        let change = IPChange(previous: previous, current: current)
+        record("ip_changed", code: "ip_changed", message: change.message, at: date)
+        return change
+    }
+
+    func record(_ kind: String, code: String, message: String, at date: Date = Date()) {
+        snapshot.events.append(GuardEvent(date: date, kind: kind, code: code, message: message))
+        snapshot.events = Array(snapshot.events.suffix(1000))
+    }
+
+    func save() throws {
+        // Preserve an unreadable history file rather than silently replacing it.
+        if let error = loadError { throw error }
+        let manager = FileManager.default
+        try manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.deletingLastPathComponent().path)
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(snapshot).write(to: url, options: .atomic)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    var recentChanges: Int {
+        zip(snapshot.records, snapshot.records.dropFirst()).filter { $0.ip != $1.ip && $1.firstSeen > Date().addingTimeInterval(-86400) }.count
+    }
+}
+
+func testIPHistory() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ClaudeGuardTest-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("ip-history.json")
+    let history = IPHistory(url: url)
+    let first = CheckResult(ok: true, message: "ok", ip: "192.0.2.10", country: "US")
+    precondition(history.observe(first) == nil)
+    precondition(history.observe(first) == nil)
+    precondition(history.snapshot.records.count == 1 && history.snapshot.records[0].checks == 2)
+    precondition(history.observe(CheckResult(ok: false, message: "timeout", kind: .transient)) == nil)
+    precondition(history.observe(CheckResult(ok: false, message: "invalid", ip: "invalid")) == nil)
+    try history.save()
+    let reloaded = IPHistory(url: url)
+    precondition(reloaded.observe(first) == nil)
+    let change = reloaded.observe(CheckResult(ok: true, message: "ok", ip: "192.0.2.20", country: "US"))
+    precondition(change?.previous.ip == first.ip && change?.current.ip == "192.0.2.20")
+    precondition(reloaded.observe(CheckResult(ok: false, message: "non-US", ip: "192.0.2.30", country: "CN", kind: .country)) != nil)
+    precondition(reloaded.snapshot.events.filter { $0.kind == "ip_changed" }.count == 2)
+    reloaded.record("quit_requested", code: "country", message: "test")
+    try reloaded.save()
+    precondition(IPHistory(url: url).snapshot.events.last?.kind == "quit_requested")
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    precondition((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    let original = Data("invalid history".utf8)
+    try original.write(to: url)
+    let invalid = IPHistory(url: url)
+    do { try invalid.save(); preconditionFailure("Unreadable history was overwritten") }
+    catch { let preserved = try Data(contentsOf: url); precondition(preserved == original) }
 }
 
 func mayOpenClaude(_ result: CheckResult, online: Bool?) -> Bool {
@@ -24,7 +173,7 @@ func mayOpenClaude(_ result: CheckResult, online: Bool?) -> Bool {
 
 func checkProxy(quick: Bool = false, selfTest: Bool = false) -> CheckResult {
     guard let script = Bundle.main.url(forResource: "proxy_check", withExtension: "rb") else {
-        return CheckResult(ok: false, message: "检测文件缺失，请重新安装 Claude 代理守卫。")
+        return CheckResult(ok: false, message: "检测文件缺失，请重新安装 Claude 代理守卫。", kind: .configuration, code: "checker_missing")
     }
     let process = Process()
     let output = Pipe()
@@ -39,7 +188,7 @@ func checkProxy(quick: Bool = false, selfTest: Bool = false) -> CheckResult {
         guard process.terminationStatus == 0 else { throw CocoaError(.executableRuntimeMismatch) }
         return try JSONDecoder().decode(CheckResult.self, from: data)
     } catch {
-        return CheckResult(ok: false, message: "无法运行出口检测，暂不允许启动 Claude。请确认 Clash Verge 已运行。")
+        return CheckResult(ok: false, message: "无法运行出口检测，暂不允许启动 Claude。请确认 Clash Verge 已运行。", kind: .transient, code: "checker_error")
     }
 }
 
@@ -119,7 +268,7 @@ private final class PixelButton: NSButton {
 let claudeBundleID = "com.anthropic.claudefordesktop"
 let claudeURL = URL(fileURLWithPath: "/Applications/Claude.app")
 
-final class GuardApp: NSObject, NSApplicationDelegate {
+final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private var panel: NSWindow!
     private let statusLine = NSMenuItem(title: "尚未核验代理出口", action: nil, keyEquivalent: "")
@@ -133,6 +282,14 @@ final class GuardApp: NSObject, NSApplicationDelegate {
     private let ipLabel = NSTextField(labelWithString: "—")
     private let countryLabel = NSTextField(labelWithString: "国家待确认")
     private let checkedLabel = NSTextField(labelWithString: "尚无核验记录")
+    private let historyNote = NSTextField(wrappingLabelWithString: "IP 历史仅保存在本机")
+    private let history = IPHistory(url: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent(Bundle.main.bundleIdentifier ?? "ClaudeEgressGuard")
+        .appendingPathComponent("ip-history.json"))
+    private var historyWindow: NSWindow?
+    private var historyText: NSTextView?
+    private var historyError: String?
+    private var changeAlert: NSAlert?
     private var launchButton: NSButton!
     private var refreshButton: NSButton!
     private let pathMonitor = NWPathMonitor()
@@ -146,6 +303,8 @@ final class GuardApp: NSObject, NSApplicationDelegate {
     private var closingPIDs = Set<pid_t>()
     private var generation = 0
     private var lastFullCheck = Date.distantPast
+    private var lastFullAttempt = Date.distantPast
+    private var runtimePolicy = RuntimePolicy()
 
     private var claudeApps: [NSRunningApplication] {
         NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID).filter { !$0.isTerminated }
@@ -154,6 +313,12 @@ final class GuardApp: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildPanel()
         buildMenu()
+        if let last = history.snapshot.records.last {
+            displayExit(ip: last.ip, country: last.country, at: last.lastSeen)
+            ipCaption.stringValue = "上次记录出口 IP"
+        }
+        recordEvent("guard_started", code: "startup", message: "守卫已启动；IP 每 60 秒核验，临时检测失败最多重试 2 次。")
+        configureNotifications()
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] event in
             guard let self = self,
@@ -162,14 +327,15 @@ final class GuardApp: NSObject, NSApplicationDelegate {
             if self.permittedPID == app.processIdentifier || (self.openingClaude && self.online == true) {
                 self.permittedPID = app.processIdentifier
             } else {
-                self.block("检测到通过原入口启动 Claude，已请求退出。请通过此面板先检查出口、再启动。")
+                self.block("检测到通过原入口启动 Claude，已请求退出。请通过此面板先检查出口、再启动。", reason: "original_launcher")
             }
         })
         observers.append(center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] event in
             guard let self = self,
                   let app = event.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.bundleIdentifier == claudeBundleID else { return }
-            self.closingPIDs.remove(app.processIdentifier)
+            let requested = self.closingPIDs.remove(app.processIdentifier) != nil
+            self.recordEvent("claude_exited", code: requested ? "guard_requested" : "external_exit", message: requested ? "已观察到 Claude 在守卫请求后退出。" : "已观察到 Claude 退出；本次没有守卫的退出请求。")
             if self.permittedPID == app.processIdentifier { self.permittedPID = nil }
         })
         pathMonitor.pathUpdateHandler = { [weak self] path in
@@ -177,8 +343,10 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         }
         pathMonitor.start(queue: DispatchQueue(label: "ClaudeExitGuard.Network"))
         timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
-            guard let self = self, !self.claudeApps.isEmpty, self.closingPIDs.isEmpty else { return }
-            self.startCheck(full: Date().timeIntervalSince(self.lastFullCheck) >= 60)
+            guard let self = self, self.closingPIDs.isEmpty else { return }
+            let active = !self.claudeApps.isEmpty || self.pendingLaunch
+            let full = (active && self.runtimePolicy.failures > 0) || Date().timeIntervalSince(active ? self.lastFullCheck : self.lastFullAttempt) >= 60
+            if active || full { self.startCheck(full: full) }
         }
         RunLoop.main.add(timer!, forMode: .common)
         if !CommandLine.arguments.contains("--background") { requestLaunch() }
@@ -190,7 +358,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
     }
 
     private func buildPanel() {
-        panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 536), styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView], backing: .buffered, defer: false)
+        panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 600), styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView], backing: .buffered, defer: false)
         panel.title = "Claude 代理守卫"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
@@ -272,12 +440,15 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         refreshButton = refresh
         let clash = PixelButton(title: "打开代理面板", target: self, action: #selector(openClash))
         clash.filled = false; clash.isBordered = false
-        let links = NSStackView(views: [refresh, clash])
+        let historyButton = PixelButton(title: "IP 历史与退出原因", target: self, action: #selector(showHistory))
+        historyButton.filled = false; historyButton.isBordered = false
+        let links = NSStackView(views: [refresh, clash, historyButton])
         links.orientation = .horizontal; links.spacing = 12; links.distribution = .fillEqually
-        let hint = NSTextField(wrappingLabelWithString: "连接每 5 秒检查 · 国家每 60 秒复核\n断网时请求正常退出；如有保存提示，请先保存。")
+        historyNote.font = .systemFont(ofSize: 10); historyNote.textColor = PixelTheme.muted
+        let hint = NSTextField(wrappingLabelWithString: "连接每 5 秒检查 · IP 每 60 秒记录 · 变化时提醒\n临时失败先重试；断网、分流异常或出口国家不符立即请求退出。")
         hint.font = .systemFont(ofSize: 10); hint.textColor = PixelTheme.muted
         hint.alignment = .center
-        let stack = NSStackView(views: [header, hero, ipCard, launchButton, links, hint])
+        let stack = NSStackView(views: [header, hero, ipCard, launchButton, links, historyNote, hint])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
         stack.setCustomSpacing(10, after: launchButton)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -290,7 +461,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
             header.widthAnchor.constraint(equalTo: stack.widthAnchor), hero.widthAnchor.constraint(equalTo: stack.widthAnchor),
             ipCard.widthAnchor.constraint(equalTo: stack.widthAnchor), launchButton.widthAnchor.constraint(equalTo: stack.widthAnchor),
             launchButton.heightAnchor.constraint(equalToConstant: 44), links.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            links.heightAnchor.constraint(equalToConstant: 32), hint.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            links.heightAnchor.constraint(equalToConstant: 32), hint.widthAnchor.constraint(equalTo: stack.widthAnchor), historyNote.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
     }
 
@@ -319,7 +490,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         menu.addItem(statusLine)
         menu.addItem(ipMenuLine)
         menu.addItem(.separator())
-        for (title, action) in [("打开保护面板", #selector(showPanel)), ("检查并打开 Claude", #selector(requestLaunch)), ("打开 Clash Verge", #selector(openClash))] {
+        for (title, action) in [("打开保护面板", #selector(showPanel)), ("检查并打开 Claude", #selector(requestLaunch)), ("IP 历史与退出原因", #selector(showHistory)), ("打开 Clash Verge", #selector(openClash))] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
             menu.addItem(item)
@@ -344,9 +515,145 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         ipLabel.textColor = good ? PixelTheme.mint : PixelTheme.muted
         countryLabel.textColor = good ? PixelTheme.mint : PixelTheme.muted
         ipCaption.stringValue = good ? "Claude 专用出口 IP" : (ipLabel.stringValue == "—" ? "出口 IP · 尚未核验" : "上次核验出口 IP")
-        statusLine.title = good ? "代理出口检查通过" : "尚未允许启动 / 已请求退出"
+        statusLine.title = good ? "代理出口检查通过" : "检查未通过，详情见历史"
         statusItem.button?.title = good ? "" : "!"
         statusItem.button?.toolTip = text
+    }
+
+    private func persistHistory() {
+        do { try history.save(); historyError = nil }
+        catch { historyError = "历史记录无法保存；原文件不会被覆盖。请检查记录文件或目录权限。" }
+        historyNote.stringValue = historyError ?? "近 24 小时 IP 变化 \(history.recentChanges) 次 · 历史与退出原因仅保存在本机"
+        updateHistoryText()
+    }
+
+    private func displayExit(ip: String, country: String?, at date: Date) {
+        ipLabel.stringValue = ip
+        ipLabel.font = .monospacedDigitSystemFont(ofSize: ip.count > 22 ? 17 : 27, weight: .semibold)
+        ipMenuLine.title = "Claude 出口 IP：" + ip
+        countryLabel.stringValue = country == "US" ? "美国 · US" : (country ?? "国家无法确认")
+        checkedLabel.stringValue = "核验于 " + DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .medium)
+    }
+
+    private func recordEvent(_ kind: String, code: String, message: String) {
+        history.record(kind, code: code, message: message)
+        persistHistory()
+    }
+
+    private func configureNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.getNotificationSettings { [weak self] settings in
+            if settings.authorizationStatus == .notDetermined {
+                center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                    if !granted {
+                        DispatchQueue.main.async { self?.recordEvent("notification_unavailable", code: "notification_disabled", message: "系统通知未启用；IP 变化仍会弹出守卫提示。") }
+                    }
+                }
+            }
+        }
+    }
+
+    private func notifyIPChange(_ change: IPChange, expectedCountry: String) {
+        let explanation = change.current.country == expectedCountry ? "新出口仍符合目标国家（\(expectedCountry)）；IP 变化本身不会触发退出。" : "新出口尚未通过目标国家核验，请查看保护状态。"
+        let content = UNMutableNotificationContent()
+        content.title = "Claude 出口 IP 已变化"
+        content.body = change.message + "\n" + explanation
+        content.sound = .default
+        content.threadIdentifier = "ClaudeGuard.IPChanges"
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { [weak self] error in
+            if error != nil {
+                DispatchQueue.main.async { self?.recordEvent("notification_unavailable", code: "notification_not_delivered", message: "系统通知未能发送；已使用守卫弹窗提醒 IP 变化。") }
+            }
+        }
+        showPanel()
+        if let alert = changeAlert {
+            alert.informativeText = change.message + "\n\n" + explanation
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Claude 出口 IP 发生变化"
+        alert.informativeText = change.message + "\n\n" + explanation
+        alert.addButton(withTitle: "知道了")
+        alert.addButton(withTitle: "查看历史")
+        changeAlert = alert
+        alert.beginSheetModal(for: panel) { [weak self] response in
+            self?.changeAlert = nil
+            if response == .alertSecondButtonReturn { self?.showHistory() }
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        DispatchQueue.main.async { self.showHistory() }
+        completionHandler()
+    }
+
+    @objc private func showHistory() {
+        if historyWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 560), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.title = "IP 历史与退出原因"
+            window.isReleasedWhenClosed = false
+            window.minSize = NSSize(width: 500, height: 360)
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.backgroundColor = PixelTheme.background
+            window.center()
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .noBorder
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 680, height: 460))
+            text.isEditable = false; text.isSelectable = true
+            text.isRichText = false
+            text.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            text.textColor = PixelTheme.ink; text.backgroundColor = PixelTheme.panel
+            text.textContainerInset = NSSize(width: 12, height: 12)
+            text.isVerticallyResizable = true; text.isHorizontallyResizable = false
+            text.autoresizingMask = [.width]
+            text.textContainer?.widthTracksTextView = true
+            scroll.documentView = text
+            historyText = text
+            let reveal = NSButton(title: "在 Finder 中显示记录文件", target: self, action: #selector(revealHistory))
+            reveal.bezelStyle = .rounded; reveal.translatesAutoresizingMaskIntoConstraints = false
+            window.contentView!.addSubview(scroll); window.contentView!.addSubview(reveal)
+            NSLayoutConstraint.activate([
+                scroll.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 16),
+                scroll.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor, constant: -16),
+                scroll.topAnchor.constraint(equalTo: window.contentView!.topAnchor, constant: 16),
+                scroll.bottomAnchor.constraint(equalTo: reveal.topAnchor, constant: -12),
+                reveal.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor, constant: -16),
+                reveal.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor, constant: -12)
+            ])
+            historyWindow = window
+        }
+        updateHistoryText()
+        historyWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func updateHistoryText() {
+        guard let text = historyText else { return }
+        let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm:ss"
+        let labels = ["guard_started": "守卫启动", "ip_changed": "IP 变化", "check_failed": "检测失败", "check_recovered": "检测恢复", "network_offline": "网络断开", "network_online": "网络连接", "blocked": "保护拦截", "quit_requested": "请求退出", "quit_rejected": "退出未接受", "claude_exited": "Claude 已退出", "notification_unavailable": "通知状态"]
+        var lines = ["出口 IP 历史", "同一 IP 的连续核验会合并；时间为本机时间。仅保留最近 500 段记录和 1000 条事件。", ""]
+        if let error = historyError { lines += [error, ""] }
+        if history.snapshot.records.isEmpty { lines += ["尚无出口核验记录。", ""] }
+        for record in history.snapshot.records.reversed() {
+            lines += [formatter.string(from: record.firstSeen) + " → " + formatter.string(from: record.lastSeen), "\(record.ip)  ·  \(record.country ?? "国家未知")  ·  核验 \(record.checks) 次", ""]
+        }
+        lines += ["检测与退出事件（最新在前）", ""]
+        for event in history.snapshot.events.reversed() {
+            lines += [formatter.string(from: event.date) + "  [" + (labels[event.kind] ?? event.kind) + "]", event.message, ""]
+        }
+        text.string = lines.joined(separator: "\n")
+    }
+
+    @objc private func revealHistory() {
+        NSWorkspace.shared.activateFileViewerSelecting([history.url])
     }
 
     private func networkChanged(available: Bool) {
@@ -354,33 +661,34 @@ final class GuardApp: NSObject, NSApplicationDelegate {
         online = available
         guard changed else { return }
         if !available {
-            block("网络已断开：禁止启动，并已请求正在运行的 Claude 正常退出。")
-        } else if pendingLaunch {
+            recordEvent("network_offline", code: "network_offline", message: "macOS 网络状态变为断开。")
+            block("网络已断开：禁止启动，并已请求正在运行的 Claude 正常退出。", reason: "network_offline")
+        } else {
+            recordEvent("network_online", code: "network_online", message: "macOS 网络已连接，开始重新核验出口。")
             startCheck(full: true)
-        } else if !claudeApps.isEmpty && closingPIDs.isEmpty {
-            startCheck(full: true)
-        } else if panel.isVisible {
-            setStatus("网络已连接，请重新核验代理出口后启动。", good: false)
         }
     }
 
-    private func requestClaudeQuit() {
+    private func requestClaudeQuit(reason: String, message: String) {
         for app in claudeApps where !closingPIDs.contains(app.processIdentifier) {
             closingPIDs.insert(app.processIdentifier)
+            recordEvent("quit_requested", code: reason, message: "已请求 Claude 桌面 App（含 Code 页面）正常退出。原因：" + message)
             if !app.terminate() {
+                recordEvent("quit_rejected", code: reason, message: "Claude 未接受退出请求，可能正在等待保存或用户处理。")
                 setStatus("Claude 未接受自动退出请求。请保存未完成内容并手动退出。", good: false)
             }
         }
         permittedPID = nil
     }
 
-    private func block(_ message: String) {
+    private func block(_ message: String, reason: String = "protection_blocked") {
         let shouldShow = pendingLaunch || !claudeApps.isEmpty || panel.isVisible
         generation += 1
         pendingLaunch = false
         openingClaude = false
+        recordEvent("blocked", code: reason, message: message)
         setStatus(message, good: false)
-        requestClaudeQuit()
+        requestClaudeQuit(reason: reason, message: message)
         if shouldShow { showPanel() }
     }
 
@@ -391,6 +699,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
             return
         }
         checking = true
+        if full { lastFullAttempt = Date() }
         launchButton.isEnabled = false
         refreshButton.isEnabled = false
         let ticket = generation
@@ -404,15 +713,30 @@ final class GuardApp: NSObject, NSApplicationDelegate {
                 self.refreshButton.isEnabled = true
                 guard ticket == self.generation else { return }
                 if let ip = result.ip {
-                    self.ipLabel.stringValue = ip
-                    self.ipLabel.font = .monospacedDigitSystemFont(ofSize: ip.count > 22 ? 17 : 27, weight: .semibold)
-                    self.ipMenuLine.title = "Claude 出口 IP：" + ip
-                    self.countryLabel.stringValue = result.country == "US" ? "美国 · US" : (result.country ?? "国家无法确认")
-                    self.checkedLabel.stringValue = "核验于 " + DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+                    self.displayExit(ip: ip, country: result.country, at: Date())
+                    let change = self.history.observe(result)
+                    self.persistHistory()
+                    if let change = change { self.notifyIPChange(change, expectedCountry: result.expectedCountry ?? "US") }
                 }
-                guard result.ok, !full || mayOpenClaude(result, online: self.online) else {
-                    self.block(result.ok ? "未取得有效的目标出口核验结果，禁止启动 Claude。" : result.message)
+                let previousFailures = self.runtimePolicy.failures
+                let decision = self.runtimePolicy.evaluate(result, running: !self.claudeApps.isEmpty, pendingLaunch: self.pendingLaunch, verifiedRecently: Date().timeIntervalSince(self.lastFullCheck) < 120)
+                if !result.ok {
+                    self.recordEvent("check_failed", code: result.code ?? "unclassified_failure", message: "\(full ? "出口完整核验" : "连通性检查")失败，第 \(self.runtimePolicy.failures) 次：" + result.message)
+                }
+                if decision == .retry {
+                    self.setStatus("检测暂时失败（\(self.runtimePolicy.failures)/3），正在重试，尚未请求退出。" + result.message, good: false)
+                    self.heroTitle.stringValue = "检测波动，正在复核"
+                    self.statusLine.title = "正在重试，尚未请求退出"
                     return
+                }
+                guard decision == .allow, !full || mayOpenClaude(result, online: self.online) else {
+                    let message = result.ok ? "未取得有效的目标出口核验结果，禁止启动 Claude。" : result.message
+                    let prefix = result.kind == .transient && self.runtimePolicy.failures >= 3 ? "连续 3 次检测失败，触发保护。" : ""
+                    self.block(prefix + message, reason: result.code ?? "invalid_exit")
+                    return
+                }
+                if previousFailures > 0 {
+                    self.recordEvent("check_recovered", code: "recovered", message: "检测恢复正常，失败计数已清零。")
                 }
                 if full { self.lastFullCheck = Date() }
                 self.setStatus(result.message, good: true)
@@ -444,7 +768,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
                     return
                 }
                 guard self.online == true, self.generation == ticket else {
-                    self.requestClaudeQuit()
+                    self.requestClaudeQuit(reason: "launch_cancelled", message: "启动过程中网络或保护状态发生变化。")
                     return
                 }
                 self.permittedPID = app.processIdentifier
@@ -482,6 +806,8 @@ final class GuardApp: NSObject, NSApplicationDelegate {
 }
 
 if CommandLine.arguments.contains("--self-test") {
+    do { try testRuntimePolicy(); try testIPHistory() }
+    catch { fputs("回归测试失败：\(error.localizedDescription)\n", stderr); exit(1) }
     let valid = CheckResult(ok: true, message: "ok", ip: "192.0.2.10", country: "US")
     precondition(mayOpenClaude(valid, online: true))
     precondition(!mayOpenClaude(valid, online: false))
@@ -495,13 +821,15 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(decoded.ip == "192.0.2.20" && decoded.expectedCountry == "US" && !mayOpenClaude(decoded, online: true))
     let result = checkProxy(selfTest: true)
     precondition(result.ok, result.message)
-    print("启动门禁及离线拒绝自检通过；" + result.message)
+    print("启动门禁、检测失败重试、IP 历史持久化与变更检测自检通过；" + result.message)
 } else if CommandLine.arguments.contains("--check") {
     let result = checkProxy(quick: CommandLine.arguments.contains("--quick"))
     var output: [String: Any] = ["ok": result.ok, "message": result.message]
     if let ip = result.ip { output["ip"] = ip }
     if let country = result.country { output["country"] = country }
     if let expectedCountry = result.expectedCountry { output["expectedCountry"] = expectedCountry }
+    if let kind = result.kind { output["kind"] = kind.rawValue }
+    if let code = result.code { output["code"] = code }
     let data = try JSONSerialization.data(withJSONObject: output)
     FileHandle.standardOutput.write(data)
     FileHandle.standardOutput.write(Data("\n".utf8))
