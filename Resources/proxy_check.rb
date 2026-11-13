@@ -15,6 +15,12 @@ end
 
 DOMAINS = %w[claude.ai claude.com claude.app claudeusercontent.com claudemcpcontent.com anthropic.com anthropic.services].freeze
 CONFIG_PATH = File.expand_path('~/.config/claude-proxy-guard/config.json').freeze
+EXIT_PROBES = [
+  [:json, 'https://ipinfo.io/json'],
+  [:json, 'https://ipinfo.io/json'],
+  [:trace, 'https://claude.ai/cdn-cgi/trace'],
+  [:trace, 'https://api.anthropic.com/cdn-cgi/trace']
+].freeze
 
 def load_settings(path = CONFIG_PATH, env = ENV)
   saved = File.exist?(path) ? JSON.parse(File.read(path)) : {}
@@ -54,6 +60,25 @@ def verify_state(system_proxy, state, rules, proxies, group: 'Claude专用', nod
   raise CheckFailed, "代理分组“#{group}”当前未选中锁定节点“#{node}”。" unless proxies.dig(group, 'now') == node
 end
 
+def claude_domain?(host)
+  normalized = host.to_s.strip.downcase.chomp('.')
+  return false if normalized.empty?
+  DOMAINS.any? { |domain| normalized == domain || normalized.end_with?(".#{domain}") }
+end
+
+def verify_connections(connections, group: 'Claude专用', node: '供应商-HTTP')
+  Array(connections).each do |conn|
+    next unless conn.is_a?(Hash)
+    meta = conn['metadata'].is_a?(Hash) ? conn['metadata'] : {}
+    matched = [meta['host'], meta['sniffHost']].find { |host| claude_domain?(host) }
+    next unless matched
+    chains = conn['chains']
+    next if chains.is_a?(Array) && chains.first == node && chains.include?(group)
+    actual = chains.is_a?(Array) && !chains.empty? ? chains.join(' ← ') : '未知链路'
+    raise CheckFailed.new("检测到 #{matched.to_s.chomp('.')} 活跃连接未走锁定节点（实际链路：#{actual}），已触发防漏保护。", kind: 'leak', code: 'route_leak')
+  end
+end
+
 def verify_country(info, expected_country = 'US')
   begin
     ip = IPAddr.new(info.fetch('ip')).to_s
@@ -75,21 +100,85 @@ def read_yaml(path)
   value
 end
 
-def curl_json(arguments, config = '', label: '代理检测', kind: 'transient')
+def curl_raw(arguments, config = '')
   output, _error, status = Open3.capture3('/usr/bin/curl', '-q', '--silent', '--fail', '--write-out', "\n%{http_code}", *arguments, stdin_data: config)
-  parse_curl_result(output, status.exitstatus, label, kind)
+  [output, status.exitstatus]
+end
+
+def curl_json(arguments, config = '', label: '代理检测', kind: 'transient')
+  output, exit_code = curl_raw(arguments, config)
+  parse_curl_result(output, exit_code, label, kind)
+end
+
+def curl_trace(arguments, label: '出口 IP 查询', kind: 'transient')
+  output, exit_code = curl_raw(arguments)
+  parse_trace_result(output, exit_code, label, kind)
+end
+
+def parse_http_body(output, exit_code, label, kind = 'transient')
+  body, _, http_status = output.rpartition("\n")
+  return body if exit_code == 0
+  code = exit_code == 28 ? 'timeout' : (http_status.to_i > 0 ? "http_#{http_status}" : "curl_#{exit_code}")
+  detail = http_status == '429' ? '被限流（HTTP 429）' : (exit_code == 28 ? '超时' : "未成功（#{code}）")
+  raise CheckFailed.new(label + detail + '，暂时无法确认检测结果。', kind: kind, code: code)
 end
 
 def parse_curl_result(output, exit_code, label, kind = 'transient')
-  body, _, http_status = output.rpartition("\n")
-  unless exit_code == 0
-    code = exit_code == 28 ? 'timeout' : (http_status.to_i > 0 ? "http_#{http_status}" : "curl_#{exit_code}")
-    detail = http_status == '429' ? '被限流（HTTP 429）' : (exit_code == 28 ? '超时' : "未成功（#{code}）")
-    raise CheckFailed.new(label + detail + '，暂时无法确认检测结果。', kind: kind, code: code)
-  end
-  JSON.parse(body)
+  JSON.parse(parse_http_body(output, exit_code, label, kind))
 rescue JSON::ParserError
   raise CheckFailed.new(label + '返回了无法解析的结果。', kind: kind, code: 'invalid_json')
+end
+
+def parse_trace_result(output, exit_code, label = '出口 IP 查询', kind = 'transient')
+  body = parse_http_body(output, exit_code, label, kind)
+  pairs = body.each_line.each_with_object({}) do |line, result|
+    key, value = line.strip.split('=', 2)
+    result[key] = value if key && value && !key.empty?
+  end
+  raise CheckFailed.new(label + '返回了无法解析的结果。', kind: kind, code: 'invalid_trace') unless pairs.key?('ip')
+  loc = pairs['loc']
+  { 'ip' => pairs['ip'], 'country' => loc == 'XX' ? nil : loc }
+end
+
+def exit_curl_args(port, url)
+  ['--http1.1', '--proxy', "http://127.0.0.1:#{port}", '--noproxy', '', '--connect-timeout', '4', '--max-time', '6', url]
+end
+
+def probe_sleep(seconds)
+  sleep(seconds)
+end
+
+def verify_exit_ip(port, expected_country = 'US', sleeper: method(:probe_sleep), &runner)
+  probe = runner || lambda do |format, url|
+    args = exit_curl_args(port, url)
+    format == :trace ? curl_trace(args, label: '出口 IP 查询') : curl_json(args, label: '出口 IP 查询')
+  end
+  last_error = nil
+  EXIT_PROBES.each_with_index do |(format, url), index|
+    sleeper.call(0.3) if index > 0
+    begin
+      return verify_country(probe.call(format, url), expected_country)
+    rescue CheckFailed => error
+      raise unless error.kind == 'transient'
+      last_error = error
+    end
+  end
+  raise last_error
+end
+
+def verify_anthropic_delay(api, node, sleeper: method(:probe_sleep))
+  query = URI.encode_www_form('url' => 'https://api.anthropic.com/', 'timeout' => '6000')
+  encoded_node = URI.encode_www_form_component(node).gsub('+', '%20')
+  2.times do |attempt|
+    sleeper.call(0.4) if attempt > 0
+    begin
+      health = api.call('/proxies/' + encoded_node + '/delay?' + query, 8)
+      raise CheckFailed.new("锁定节点“#{node}”无法通过 Anthropic 连通性检测，请检查节点。", kind: 'transient', code: 'anthropic_unreachable') unless health['delay'].to_i > 0
+      return health
+    rescue CheckFailed => error
+      raise if attempt == 1 || error.kind != 'transient'
+    end
+  end
 end
 
 def check_proxy(quick: false)
@@ -114,16 +203,10 @@ def check_proxy(quick: false)
   end
   state = api.call('/configs')
   verify_state(system_proxy, state, api.call('/rules').fetch('rules'), api.call('/proxies').fetch('proxies'), group: settings[:group], node: settings[:node])
-  unless quick
-    port = state.fetch('mixed-port').to_i
-    info = curl_json(['--proxy', "http://127.0.0.1:#{port}", '--noproxy', '', '--connect-timeout', '3', '--max-time', '8', 'https://ipinfo.io/json'], label: '出口 IP 查询')
-    verified = verify_country(info, settings[:country])
-  end
-  query = URI.encode_www_form('url' => 'https://api.anthropic.com/', 'timeout' => '6000')
-  encoded_node = URI.encode_www_form_component(settings[:node]).gsub('+', '%20')
-  health = api.call('/proxies/' + encoded_node + '/delay?' + query, 8)
-  raise CheckFailed.new("锁定节点“#{settings[:node]}”无法通过 Anthropic 连通性检测，请检查节点。", kind: 'transient', code: 'anthropic_unreachable') unless health['delay'].to_i > 0
-  return { ok: true, message: '系统代理、Claude 分流和 Anthropic 连通性检查通过。', expectedCountry: settings[:country] } if quick
+  verify_connections(api.call('/connections')['connections'], group: settings[:group], node: settings[:node])
+  verified = verify_exit_ip(state.fetch('mixed-port').to_i, settings[:country]) unless quick
+  verify_anthropic_delay(api, settings[:node])
+  return { ok: true, message: '系统代理、Claude 分流、活跃连接和 Anthropic 连通性检查通过。', expectedCountry: settings[:country] } if quick
   label = settings[:country] == 'US' ? '美国出口' : "#{settings[:country]} 出口"
   { ok: true, message: "#{label}已核验，代理连通正常。运行中将持续监测。" }.merge(verified)
 rescue CheckFailed => error
@@ -194,6 +277,59 @@ def self_test
     verify_country('ip' => '192.0.2.20')
   rescue CheckFailed => error
     raise 'Unknown country should be retried' unless error.kind == 'transient' && error.code == 'country_unknown'
+  end
+  raise 'Exit curl args must force HTTP/1.1' unless exit_curl_args(7897, 'https://ipinfo.io/json').include?('--http1.1')
+  raise 'Trace response did not parse' unless parse_trace_result("fl=1\nip=192.0.2.15\nloc=US\n\n200", 0) == { 'ip' => '192.0.2.15', 'country' => 'US' }
+  raise 'Trace XX country must map to nil' unless parse_trace_result("ip=192.0.2.15\nloc=XX\n\n200", 0) == { 'ip' => '192.0.2.15', 'country' => nil }
+  calls = []
+  retried_ip = verify_exit_ip(7897, 'US', sleeper: ->(_) {}) do |fmt, url|
+    calls << [fmt, url]
+    raise CheckFailed.new('出口 IP 查询超时，暂时无法确认检测结果。', kind: 'transient', code: 'timeout') if calls.length == 1
+    { 'ip' => '192.0.2.11', 'country' => 'US' }
+  end
+  raise 'Primary ipinfo transient failure did not retry' unless calls.map(&:last) == ['https://ipinfo.io/json', 'https://ipinfo.io/json'] && retried_ip == { ip: '192.0.2.11', country: 'US', expectedCountry: 'US' }
+  fallback_calls = []
+  fallback_ip = verify_exit_ip(7897, 'US', sleeper: ->(_) {}) do |fmt, url|
+    fallback_calls << [fmt, url]
+    raise CheckFailed.new('出口 IP 查询超时，暂时无法确认检测结果。', kind: 'transient', code: 'timeout') if url.include?('ipinfo.io')
+    { 'ip' => '192.0.2.12', 'country' => 'US' }
+  end
+  raise 'Fallback trace source was not used after ipinfo retries failed' unless fallback_calls.last == [:trace, 'https://claude.ai/cdn-cgi/trace'] && fallback_ip == { ip: '192.0.2.12', country: 'US', expectedCountry: 'US' }
+  non_us_calls = 0
+  begin
+    verify_exit_ip(7897, 'US', sleeper: ->(_) {}) do |_fmt, _url|
+      non_us_calls += 1
+      { 'ip' => '192.0.2.20', 'country' => 'CN' }
+    end
+    raise 'Non-US exit was accepted'
+  rescue CheckFailed => error
+    raise 'Non-US exit must stop immediately without fallback' unless non_us_calls == 1 && error.kind == 'country' && error.code == 'country_mismatch'
+  end
+  delay_calls = 0
+  verify_anthropic_delay(lambda { |_path, _timeout = 8|
+    delay_calls += 1
+    raise CheckFailed.new('Anthropic 连通性检测未成功（http_504），暂时无法确认检测结果。', kind: 'transient', code: 'http_504') if delay_calls == 1
+    { 'delay' => 240 }
+  }, node, sleeper: ->(_) {})
+  raise 'Anthropic delay transient failure did not retry once' unless delay_calls == 2
+  verify_connections(nil, group: group, node: node)
+  verify_connections([
+    { 'metadata' => { 'host' => 'notclaude.ai' }, 'chains' => ['DIRECT'] },
+    { 'metadata' => { 'host' => 'api.anthropic.com.' }, 'chains' => [node, group] },
+    { 'metadata' => { 'host' => '', 'sniffHost' => 'claude.ai' }, 'chains' => [node, 'ISP自动容错', group] }
+  ], group: group, node: node)
+  [
+    [{ 'metadata' => { 'host' => 'claude.ai' }, 'chains' => ['DIRECT'] }],
+    [{ 'metadata' => { 'host' => '', 'sniffHost' => 'api.anthropic.com' }, 'chains' => ['DIRECT'] }],
+    [{ 'metadata' => { 'host' => 'claude.com' }, 'chains' => ['其他节点', group] }],
+    [{ 'metadata' => { 'host' => 'anthropic.com' }, 'chains' => [node, 'GLOBAL'] }]
+  ].each do |bad_conns|
+    begin
+      verify_connections(bad_conns, group: group, node: node)
+      raise 'Route leak was not rejected'
+    rescue CheckFailed => error
+      raise 'Route leak must be classified as leak' unless error.kind == 'leak' && error.code == 'route_leak'
+    end
   end
   { ok: true, message: "自检通过：正常状态及 #{failures.length} 种异常状态均符合预期，出口 IP 会保留供面板显示。" }
 end

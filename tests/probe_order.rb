@@ -17,11 +17,14 @@ def Open3.capture3(*arguments, **)
   [text, '', Class.new { def success?; true; end }.new]
 end
 
+def probe_sleep(_seconds); end
+
 def curl_json(arguments, _config = '', **)
   url = arguments.last
   return { 'mode' => 'rule', 'mixed-port' => 7897 } if url.end_with?('/configs')
   return { 'rules' => DOMAINS.map { |d| { 'type' => 'DomainSuffix', 'payload' => d, 'proxy' => 'Claude专用' } } } if url.end_with?('/rules')
   return { 'proxies' => { 'Claude专用' => { 'now' => '供应商-HTTP' } } } if url.end_with?('/proxies')
+  return { 'connections' => $probe_connections || [] } if url.end_with?('/connections')
   if url.include?('ipinfo.io')
     $probe_calls << :ip
     raise CheckFailed.new('IP lookup timeout', kind: 'transient', code: 'timeout') if $probe_ip_timeout
@@ -33,6 +36,12 @@ def curl_json(arguments, _config = '', **)
     return { 'delay' => 200 }
   end
   raise 'Unexpected request'
+end
+
+def curl_trace(_arguments, **)
+  $probe_calls << :trace
+  raise CheckFailed.new('Trace lookup timeout', kind: 'transient', code: 'timeout') if $probe_trace_timeout
+  { 'ip' => '192.0.2.10', 'country' => $probe_country }
 end
 
 def expect_failure(kind, code, ip: nil, quick: false)
@@ -50,9 +59,10 @@ Dir.mktmpdir('cg-probes-', '/tmp') do |directory|
   $probe_socket = File.join(directory, 'controller.sock')
   server = UNIXServer.new($probe_socket)
   begin
-    $probe_calls = []; $probe_country = 'US'; $probe_health_timeout = true; $probe_ip_timeout = false
+    $probe_connections = []
+    $probe_calls = []; $probe_country = 'US'; $probe_health_timeout = true; $probe_ip_timeout = false; $probe_trace_timeout = false
     expect_failure('transient', 'http_504', ip: '192.0.2.10')
-    raise 'Health failure hid the exit lookup' unless $probe_calls == [:ip, :health]
+    raise 'Health failure hid the exit lookup or skipped retry' unless $probe_calls == [:ip, :health, :health]
 
     $probe_calls = []; $probe_country = 'CN'
     expect_failure('country', %w[country_not_us country_mismatch], ip: '192.0.2.10')
@@ -60,16 +70,26 @@ Dir.mktmpdir('cg-probes-', '/tmp') do |directory|
 
     $probe_calls = []; $probe_country = 'US'
     expect_failure('transient', 'http_504', quick: true)
-    raise 'Quick check unexpectedly queried the IP' unless $probe_calls == [:health]
+    raise 'Quick check unexpectedly queried the IP' unless $probe_calls == [:health, :health]
 
     $probe_calls = []; $probe_health_timeout = false
     result = check_proxy
     raise 'A healthy US exit was rejected' unless result[:ok] && result[:country] == 'US'
     raise 'Full check order changed' unless $probe_calls == [:ip, :health]
 
-    $probe_calls = []; $probe_ip_timeout = true
+    $probe_calls = []; $probe_ip_timeout = true; $probe_trace_timeout = false
+    fallback_result = check_proxy
+    raise 'Trace fallback did not recover US exit' unless fallback_result[:ok] && fallback_result[:country] == 'US'
+    raise 'Trace fallback sequence changed' unless $probe_calls == [:ip, :ip, :trace, :health]
+
+    $probe_calls = []; $probe_ip_timeout = true; $probe_trace_timeout = true
     expect_failure('transient', 'timeout')
-    raise 'Unknown exit was treated as a confirmed country' unless $probe_calls == [:ip]
+    raise 'Unknown exit was treated as a confirmed country' unless $probe_calls == [:ip, :ip, :trace, :trace]
+
+    $probe_calls = []; $probe_ip_timeout = false; $probe_trace_timeout = false
+    $probe_connections = [{ 'metadata' => { 'host' => 'claude.ai' }, 'chains' => ['DIRECT'] }]
+    expect_failure('leak', 'route_leak')
+    raise 'Live route leak did not stop before external probes' unless $probe_calls.empty?
   ensure
     server.close
   end

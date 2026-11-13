@@ -3,7 +3,7 @@ import Network
 import UserNotifications
 
 enum FailureKind: String, Codable {
-    case configuration, country, transient
+    case configuration, country, leak, transient
 }
 
 struct CheckResult: Decodable {
@@ -26,36 +26,96 @@ struct CheckResult: Decodable {
     }
 }
 
-enum MonitorDecision { case allow, warn, block }
+enum MonitorDecision { case allow, retry, warn, block }
 
 struct RuntimePolicy {
+    static let transientWarnThreshold = 3
     private(set) var failures = 0
 
-    mutating func evaluate(_ result: CheckResult, running: Bool, pendingLaunch: Bool) -> MonitorDecision {
+    mutating func evaluate(_ result: CheckResult, running: Bool, pendingLaunch: Bool, userInitiated: Bool = false) -> MonitorDecision {
         if result.ok { failures = 0; return .allow }
         failures += 1
         // Network loss is handled by NWPathMonitor; failed probes alone never quit a running session.
-        if result.kind == .country { return .block }
-        return running || !pendingLaunch ? .warn : .block
+        if result.kind == .country || result.kind == .leak { return .block }
+        if !running && pendingLaunch { return .block }
+        if result.kind == .transient && !userInitiated && failures < Self.transientWarnThreshold { return .retry }
+        return .warn
+    }
+}
+
+struct NetworkGate {
+    static let settleDelay: TimeInterval = 2.0
+    private(set) var online: Bool?
+    private(set) var readyAt: Date = .distantPast
+
+    mutating func updateOnline(_ available: Bool, now: Date = Date()) -> (changed: Bool, delay: TimeInterval?) {
+        let wasOnline = online
+        online = available
+        guard wasOnline != available else { return (false, nil) }
+        guard available else {
+            readyAt = .distantPast
+            return (true, nil)
+        }
+        if wasOnline == false {
+            readyAt = now.addingTimeInterval(Self.settleDelay)
+            return (true, Self.settleDelay)
+        }
+        return (true, 0)
+    }
+
+    mutating func markWake(now: Date = Date()) -> TimeInterval {
+        readyAt = max(readyAt, now.addingTimeInterval(Self.settleDelay))
+        return max(0, readyAt.timeIntervalSince(now))
+    }
+
+    func canPoll(now: Date = Date()) -> Bool {
+        online == true && now >= readyAt
     }
 }
 
 func testRuntimePolicy() throws {
     var policy = RuntimePolicy()
     let timeout = CheckResult(ok: false, message: "测试超时", kind: .transient, code: "timeout")
-    for attempt in 1...20 {
+    for attempt in 1...2 {
+        guard policy.evaluate(timeout, running: true, pendingLaunch: false) == .retry else {
+            throw NSError(domain: "GuardRegression", code: 1, userInfo: [NSLocalizedDescriptionKey: "第 \(attempt) 次瞬时超时未防抖静默重试。"])
+        }
+    }
+    for attempt in 3...20 {
         guard policy.evaluate(timeout, running: true, pendingLaunch: false) == .warn else {
-            throw NSError(domain: "GuardRegression", code: 1, userInfo: [NSLocalizedDescriptionKey: "连续第 \(attempt) 次测速超时误触发退出，应当仅告警。"])
+            throw NSError(domain: "GuardRegression", code: 2, userInfo: [NSLocalizedDescriptionKey: "连续第 \(attempt) 次测速超时误触发退出，应当仅告警。"])
         }
     }
     precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: true, pendingLaunch: false) == .allow)
     precondition(policy.failures == 0)
-    precondition(policy.evaluate(timeout, running: true, pendingLaunch: true) == .warn)
-    precondition(policy.evaluate(timeout, running: false, pendingLaunch: false) == .warn)
-    precondition(policy.evaluate(timeout, running: false, pendingLaunch: true) == .block)
+    precondition(policy.evaluate(timeout, running: false, pendingLaunch: false) == .retry)
+    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: false, pendingLaunch: false) == .allow)
+    precondition(policy.evaluate(timeout, running: false, pendingLaunch: false, userInitiated: true) == .warn)
+    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: false, pendingLaunch: false) == .allow)
+    precondition(policy.evaluate(timeout, running: true, pendingLaunch: true, userInitiated: true) == .warn)
+    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: true, pendingLaunch: false) == .allow)
+    precondition(policy.evaluate(timeout, running: false, pendingLaunch: true, userInitiated: true) == .block)
+    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: true, pendingLaunch: false) == .allow)
     precondition(policy.evaluate(CheckResult(ok: false, message: "configuration", kind: .configuration), running: true, pendingLaunch: false) == .warn)
-    precondition(policy.evaluate(CheckResult(ok: false, message: "country unknown", ip: "192.0.2.10", kind: .transient), running: true, pendingLaunch: false) == .warn)
+    precondition(policy.evaluate(CheckResult(ok: true, message: "ok"), running: true, pendingLaunch: false) == .allow)
+    precondition(policy.evaluate(CheckResult(ok: false, message: "country unknown", ip: "192.0.2.10", kind: .transient), running: true, pendingLaunch: false) == .retry)
     precondition(policy.evaluate(CheckResult(ok: false, message: "non-US", ip: "192.0.2.20", country: "CN", kind: .country), running: true, pendingLaunch: false) == .block)
+    precondition(policy.evaluate(CheckResult(ok: false, message: "direct leak", kind: .leak, code: "route_leak"), running: true, pendingLaunch: false) == .block)
+
+    var gate = NetworkGate()
+    let t0 = Date(timeIntervalSince1970: 1_000)
+    precondition(!gate.canPoll(now: t0))
+    let cold = gate.updateOnline(true, now: t0)
+    precondition(cold.changed && cold.delay == 0 && gate.canPoll(now: t0))
+    precondition(!gate.updateOnline(true, now: t0).changed)
+    let off = gate.updateOnline(false, now: t0.addingTimeInterval(10))
+    precondition(off.changed && off.delay == nil && !gate.canPoll(now: t0.addingTimeInterval(15)))
+    let reconn = gate.updateOnline(true, now: t0.addingTimeInterval(20))
+    precondition(reconn.changed && reconn.delay == 2.0)
+    precondition(!gate.canPoll(now: t0.addingTimeInterval(21.5)))
+    precondition(gate.canPoll(now: t0.addingTimeInterval(22.0)))
+    let wakeDelay = gate.markWake(now: t0.addingTimeInterval(50))
+    precondition(wakeDelay == 2.0 && !gate.canPoll(now: t0.addingTimeInterval(51.0)) && gate.canPoll(now: t0.addingTimeInterval(52.0)))
 }
 
 struct IPRecord: Codable {
@@ -294,9 +354,11 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     private var refreshButton: NSButton!
     private let pathMonitor = NWPathMonitor()
     private var timer: Timer?
+    private var settleWorkItem: DispatchWorkItem?
     private var observers: [NSObjectProtocol] = []
     private var checking = false
-    private var online: Bool?
+    private var networkGate = NetworkGate()
+    private var online: Bool? { networkGate.online }
     private var pendingLaunch = false
     private var openingClaude = false
     private var permittedPID: pid_t?
@@ -318,7 +380,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
             displayExit(ip: last.ip, country: last.country, at: last.lastSeen)
             ipCaption.stringValue = "上次记录出口 IP"
         }
-        recordEvent("guard_started", code: "startup", message: "守卫已启动；IP 每 60 秒核验，测速或查询失败仅告警，断网或确认出口国家不符时请求退出。")
+        recordEvent("guard_started", code: "startup", message: "守卫已启动；IP 每 60 秒核验，连续 3 次探测超时才告警，断网、出口国家不符或连接直连防漏时请求退出。")
         configureNotifications()
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] event in
@@ -339,14 +401,21 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
             self.recordEvent("claude_exited", code: requested ? "guard_requested" : "external_exit", message: requested ? "已观察到 Claude 在守卫请求后退出。" : "已观察到 Claude 退出；本次没有守卫的退出请求。")
             if self.permittedPID == app.processIdentifier { self.permittedPID = nil }
         })
+        observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            let delay = self.networkGate.markWake()
+            self.recordEvent("system_wake", code: "wake", message: "系统从休眠唤醒，等待 \(Int(delay)) 秒链路稳定后复核出口。")
+            self.scheduleSettledCheck(after: delay)
+        })
         pathMonitor.pathUpdateHandler = { [weak self] path in
             DispatchQueue.main.async { self?.networkChanged(available: path.status == .satisfied) }
         }
         pathMonitor.start(queue: DispatchQueue(label: "ClaudeExitGuard.Network"))
         timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
-            guard let self = self, self.closingPIDs.isEmpty else { return }
+            guard let self = self, self.closingPIDs.isEmpty, self.networkGate.canPoll() else { return }
             let active = !self.claudeApps.isEmpty || self.pendingLaunch
-            let full = Date().timeIntervalSince(self.lastFullAttempt) >= 60
+            let retryInterval: TimeInterval = (self.runtimePolicy.failures > 0 || self.exitWarning != nil) ? 15 : 60
+            let full = Date().timeIntervalSince(self.lastFullAttempt) >= retryInterval
             if active || full { self.startCheck(full: full) }
         }
         RunLoop.main.add(timer!, forMode: .common)
@@ -446,7 +515,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         let links = NSStackView(views: [refresh, clash, historyButton])
         links.orientation = .horizontal; links.spacing = 12; links.distribution = .fillEqually
         historyNote.font = .systemFont(ofSize: 10); historyNote.textColor = PixelTheme.muted
-        let hint = NSTextField(wrappingLabelWithString: "连接每 5 秒检查 · IP 每 60 秒记录 · 变化时提醒\n测速失败仅提醒；断网或确认出口国家不符时请求退出。")
+        let hint = NSTextField(wrappingLabelWithString: "连接与防漏每 5 秒检查 · IP 每 60 秒记录 · 变化时提醒\n连续 3 次探测超时才提醒；断网、确认非目标出口或连接直连防漏时请求退出。")
         hint.font = .systemFont(ofSize: 10); hint.textColor = PixelTheme.muted
         hint.alignment = .center
         let stack = NSStackView(views: [header, hero, ipCard, launchButton, links, historyNote, hint])
@@ -656,7 +725,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     private func updateHistoryText() {
         guard let text = historyText else { return }
         let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm:ss"
-        let labels = ["guard_started": "守卫启动", "ip_changed": "IP 变化", "check_failed": "检测失败", "check_recovered": "检测恢复", "monitor_warning": "仅提醒，未退出", "network_offline": "网络断开", "network_online": "网络连接", "blocked": "保护拦截", "quit_requested": "请求退出", "quit_rejected": "退出未接受", "claude_exited": "Claude 已退出", "notification_unavailable": "通知状态"]
+        let labels = ["guard_started": "守卫启动", "ip_changed": "IP 变化", "check_failed": "检测失败", "check_recovered": "检测恢复", "monitor_warning": "仅提醒，未退出", "network_offline": "网络断开", "network_online": "网络连接", "system_wake": "系统唤醒", "blocked": "保护拦截", "quit_requested": "请求退出", "quit_rejected": "退出未接受", "claude_exited": "Claude 已退出", "notification_unavailable": "通知状态"]
         var lines = ["出口 IP 历史", "同一 IP 的连续核验会合并；时间为本机时间。仅保留最近 500 段记录和 1000 条事件。", ""]
         if let error = historyError { lines += [error, ""] }
         if history.snapshot.records.isEmpty { lines += ["尚无出口核验记录。", ""] }
@@ -674,16 +743,36 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         NSWorkspace.shared.activateFileViewerSelecting([history.url])
     }
 
+    private func scheduleSettledCheck(after delay: TimeInterval) {
+        settleWorkItem?.cancel()
+        guard delay > 0 else {
+            startCheck(full: true, userInitiated: pendingLaunch)
+            return
+        }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self, self.online == true else { return }
+            self.startCheck(full: true, userInitiated: self.pendingLaunch)
+        }
+        settleWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
     private func networkChanged(available: Bool) {
-        let changed = online != available
-        online = available
-        guard changed else { return }
-        if !available {
+        let transition = networkGate.updateOnline(available)
+        guard transition.changed, let onlineNow = online else { return }
+        if !onlineNow {
+            settleWorkItem?.cancel()
             recordEvent("network_offline", code: "network_offline", message: "macOS 网络状态变为断开。")
             block("网络已断开：禁止启动，并已请求正在运行的 Claude 正常退出。", reason: "network_offline")
+        } else if let delay = transition.delay, delay > 0 {
+            recordEvent("network_online", code: "network_online", message: "macOS 网络已恢复，等待 \(Int(delay)) 秒链路稳定后重新核验出口。")
+            if panel.isVisible || pendingLaunch {
+                showChecking("网络刚恢复，等待链路稳定后核验出口…")
+            }
+            scheduleSettledCheck(after: delay)
         } else {
             recordEvent("network_online", code: "network_online", message: "macOS 网络已连接，开始重新核验出口。")
-            startCheck(full: true)
+            startCheck(full: true, userInitiated: pendingLaunch)
         }
     }
 
@@ -710,10 +799,19 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         if shouldShow { showPanel() }
     }
 
-    private func startCheck(full: Bool) {
+    private func startCheck(full: Bool, userInitiated: Bool = false) {
         guard !checking, closingPIDs.isEmpty else { return }
         guard online == true else {
-            if online == false { block("网络未连接，禁止启动 Claude。") }
+            if online == false && (userInitiated || !claudeApps.isEmpty) {
+                block("网络未连接，禁止启动 Claude。")
+            }
+            return
+        }
+        if !networkGate.canPoll() {
+            if userInitiated {
+                showChecking("网络刚恢复，等待链路稳定后核验出口…")
+                scheduleSettledCheck(after: max(0.1, networkGate.readyAt.timeIntervalSinceNow))
+            }
             return
         }
         checking = true
@@ -721,7 +819,9 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         launchButton.isEnabled = false
         refreshButton.isEnabled = false
         let ticket = generation
-        if full { showChecking("正在检查代理连接和目标出口，请稍候。") }
+        if full && (userInitiated || ipLabel.stringValue == "—") {
+            showChecking("正在检查代理连接和目标出口，请稍候。")
+        }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result = checkProxy(quick: !full)
             DispatchQueue.main.async {
@@ -738,12 +838,14 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
                 }
                 let previousFailures = self.runtimePolicy.failures
                 let previousExitWarning = self.exitWarning
-                if full { self.exitWarning = result.ip == nil || result.country == nil ? result.message : nil }
                 let running = !self.claudeApps.isEmpty
-                let decision = self.runtimePolicy.evaluate(result, running: running, pendingLaunch: self.pendingLaunch)
+                let decision = self.runtimePolicy.evaluate(result, running: running, pendingLaunch: self.pendingLaunch, userInitiated: userInitiated)
                 if !result.ok {
-                    self.recordEvent("check_failed", code: result.code ?? "unclassified_failure", message: "\(full ? "出口完整核验" : "连通性检查")失败，第 \(self.runtimePolicy.failures) 次：" + result.message)
+                    let suffix = decision == .retry ? "（瞬时波动防抖，静默待重试 \(self.runtimePolicy.failures)/\(RuntimePolicy.transientWarnThreshold)）" : ""
+                    self.recordEvent("check_failed", code: result.code ?? "unclassified_failure", message: "\(full ? "出口完整核验" : "连通性检查")失败，第 \(self.runtimePolicy.failures) 次\(suffix)：" + result.message)
                 }
+                if decision == .retry { return }
+                if full { self.exitWarning = result.ip == nil || result.country == nil ? result.message : nil }
                 if decision == .warn {
                     self.pendingLaunch = false
                     self.setStatus((running ? "仅提醒，Claude 保持运行。" : "本次检测未通过，启动前需重新核验。") + result.message, good: false)
@@ -770,7 +872,7 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
                 }
                 if self.pendingLaunch {
                     if full { self.launchClaude(ticket: ticket) }
-                    else { self.startCheck(full: true) }
+                    else { self.startCheck(full: true, userInitiated: userInitiated) }
                 } else if let app = self.claudeApps.first {
                     self.permittedPID = app.processIdentifier
                 }
@@ -812,10 +914,10 @@ final class GuardApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         }
         pendingLaunch = true
         if online == nil { showChecking("正在确认网络连接…") }
-        startCheck(full: true)
+        startCheck(full: true, userInitiated: true)
     }
 
-    @objc private func refresh() { startCheck(full: true) }
+    @objc private func refresh() { startCheck(full: true, userInitiated: true) }
     @objc private func showPanel() {
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
